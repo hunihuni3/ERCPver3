@@ -1,0 +1,16 @@
+../Core/Src/tmc2209_uart.c:74:13:dwt_init	4	static
+../Core/Src/tmc2209_uart.c:84:20:wait_bit	16	static
+../Core/Src/tmc2209_uart.c:94:20:line_release	16	static
+../Core/Src/tmc2209_uart.c:98:20:line_pull_low	16	static
+../Core/Src/tmc2209_uart.c:102:23:line_read	16	static
+../Core/Src/tmc2209_uart.c:113:16:tmc_crc8	24	static
+../Core/Src/tmc2209_uart.c:132:13:uart_tx_byte	40	static,ignoring_inline_asm
+../Core/Src/tmc2209_uart.c:162:13:uart_rx_byte	40	static
+../Core/Src/tmc2209_uart.c:197:21:tmc_read_reg	48	static,ignoring_inline_asm
+../Core/Src/tmc2209_uart.c:241:13:tmc_write_reg	32	static
+../Core/Src/tmc2209_uart.c:258:17:tmc_read_ifcnt	32	static
+../Core/Src/tmc2209_uart.c:271:16:microsteps_to_mres	16	static
+../Core/Src/tmc2209_uart.c:292:16:current_ma_to_cs	32	static
+../Core/Src/tmc2209_uart.c:307:14:TMC2209uart	72	static
+../Core/Src/tmc2209_uart.c:437:6:tmc_write_nodeconf	24	static
+../Core/Src/tmc2209_uart.c:449:14:tmc_diag_read	24	static
