@@ -27,8 +27,6 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-int acc_steps = 0;
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -36,18 +34,6 @@ int acc_steps = 0;
 
 #define MICROSTEP 16
 #define CPR 2048
-
-/* --- Motor 1 pin macros (open-drain not needed here; STEP/DIR are push-pull) */
-#define M1_STEP_PORT   GPIOC
-#define M1_STEP_PIN    GPIO_PIN_1
-#define M1_DIR_PORT    GPIOC
-#define M1_DIR_PIN     GPIO_PIN_2
-#define M1_EN_PORT     GPIOC
-#define M1_EN_PIN      GPIO_PIN_0
-
-/* TMC2209 enable is ACTIVE LOW: drive EN low to energise the driver. */
-#define M1_DRIVER_ENABLE()   HAL_GPIO_WritePin(M1_EN_PORT, M1_EN_PIN, GPIO_PIN_RESET)
-#define M1_DRIVER_DISABLE()  HAL_GPIO_WritePin(M1_EN_PORT, M1_EN_PIN, GPIO_PIN_SET)
 
 /* Exact counts->microsteps ratio.
  *   3200 microsteps/rev  /  8192 enc counts/rev  =  25/64  (exact)
@@ -59,16 +45,6 @@ int acc_steps = 0;
 
 /* STEP pulse high time, in CPU cycles. At 168 MHz, 168 cycles ~= 1 us. */
 #define STEP_PULSE_CYCLES    (SystemCoreClock / 1000000u)
-
-/* How often to emit a debug line, in milliseconds (does NOT throttle stepping) */
-#define DEBUG_PRINT_PERIOD_MS  50u
-
-/* file-scope state for the follow loop */
-//static int32_t  enc_prev      = 0;     /* last TIM2 count we saw            */			//all obsolete now they live in the multi stepper struct now..
-//static int64_t  step_accum_num = 0;    /* fractional-step accumulator       */
-                                       /* (numerator units; /RATIO_DEN = us) */
-extern TIM_HandleTypeDef htim2;        /* CubeMX-generated handle           */
-
 
 /* USER CODE END PD */
 
@@ -107,12 +83,11 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-char tx_buf[64];
 #include <stdio.h>
-#include <stdlib.h>
 
 int _write(int file, char *ptr, int len)
 {
+    (void)file;
     HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, HAL_MAX_DELAY);
     return len;
 }
@@ -133,17 +108,10 @@ typedef enum {
 } Tool;
 
 volatile Mode current_mode = MODE_PRECISION; 					// MODE_PRECISION is just 1:1 matching mode. encoders turned out to be accurate enough to just 1:1 match.
-//Mode current_mode = MODE_FAST;
 
 volatile Tool current_tool = TOOL_CATHETER;
-//
-uint8_t rx;  // UART 입력용
 
-//int32_t target_pos = 0;   			// obsolete
-
-
-
-/* DWT cycle counter init — call once before the loop. Used for the ~1us pulse. */
+/* DWT cycle counter init ??call once before the loop. Used for the ~1us pulse. */
 static void dwt_delay_init(void)
 {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -166,13 +134,6 @@ static inline void step_pulse(GPIO_TypeDef *port, uint16_t pin)
     HAL_GPIO_WritePin(port, pin, GPIO_PIN_RESET);
     dwt_delay_cycles(STEP_PULSE_CYCLES);
 }
-
-//Trapezoidal position follower position error law implementation
-//static int32_t current_pos = 0; //microsteps actually emitted
-//static float vel = 0.0f; //signed steps/s persists per tick
-//tatic float emit_accum = 0.0f; //fractional step carry for emissio
-//above are all obsolete and lives in struct
-
 
 #define V_MAX 51200.0f //steps/s ceiling
 #define A_MAX 160000.0f //steps/s^2 max
@@ -217,17 +178,17 @@ typedef struct {
 #define N_MOT 5
 
 /* STEP/DIR/EN below are read from your schematic and are confident.
- * pdn_pin for M3/M4/M5 and all tmc_addr are NOT — see confirm-list. */
+ * pdn_pin for M3/M4/M5 and all tmc_addr are NOT ??see confirm-list. */
 
 // gain_en determines if motor is subject to gain variation by gain button; only enable for feeder, not position tracking knobs.
 // gear D is input gear, gearN is output gear.
 static Motor mot[N_MOT] = {
-  /* step               dir                en                pdn(TMC)          addr gain_en gearN gearD* dir_sign */
-  { GPIOC,GPIO_PIN_1,  GPIOC,GPIO_PIN_2,  GPIOC,GPIO_PIN_0,  GPIOB,GPIO_PIN_0,  0 , 0 , 95 , 26 , -1}, /* M1 PDN_UART1=PB0 */
-  { GPIOC,GPIO_PIN_4,  GPIOC,GPIO_PIN_5,  GPIOC,GPIO_PIN_3,  GPIOB,GPIO_PIN_0,  1 , 0,  171 , 181 , +1}, /* M2 PDN_UART2=PB0 */
-  { GPIOC,GPIO_PIN_9,  GPIOC,GPIO_PIN_10, GPIOC,GPIO_PIN_8,  GPIOB,GPIO_PIN_0,  2 , 0 , 18 , 70 , +1}, /* M3 PDN_UART3=PB0 */
-  { GPIOC,GPIO_PIN_12, GPIOC,GPIO_PIN_13, GPIOC,GPIO_PIN_11, GPIOB,GPIO_PIN_0,  3 , 1 , 1 , 1 , +1}, /* M4 PDN_UART4=PB0 */
-  { GPIOA,GPIO_PIN_11, GPIOD,GPIO_PIN_2,  GPIOA,GPIO_PIN_12, GPIOB,GPIO_PIN_1,  0 , 1 , 1 , 1 , +1}, /* M5 PDN_UART5=PB1  */
+  /* step               dir                en                pdn(TMC)          addr gain gearN gearD sign runtime state */
+  { GPIOC,GPIO_PIN_1,  GPIOC,GPIO_PIN_2,  GPIOC,GPIO_PIN_0,  GPIOB,GPIO_PIN_0,  0, 0,  95,  26, -1, 0, 0, 0, 0.0f, 0.0f },
+  { GPIOC,GPIO_PIN_4,  GPIOC,GPIO_PIN_5,  GPIOC,GPIO_PIN_3,  GPIOB,GPIO_PIN_0,  1, 0, 171, 181, +1, 0, 0, 0, 0.0f, 0.0f },
+  { GPIOC,GPIO_PIN_9,  GPIOC,GPIO_PIN_10, GPIOC,GPIO_PIN_8,  GPIOB,GPIO_PIN_0,  2, 0,  18,  70, +1, 0, 0, 0, 0.0f, 0.0f },
+  { GPIOC,GPIO_PIN_12, GPIOC,GPIO_PIN_13, GPIOC,GPIO_PIN_11, GPIOB,GPIO_PIN_0,  3, 1,   1,   1, +1, 0, 0, 0, 0.0f, 0.0f },
+  { GPIOA,GPIO_PIN_11, GPIOD,GPIO_PIN_2,  GPIOA,GPIO_PIN_12, GPIOB,GPIO_PIN_1,  0, 1,   1,   1, +1, 0, 0, 0, 0.0f, 0.0f },
 };
 
 /* enc4 routes to exactly one of M4/M5 at a time */
@@ -266,33 +227,31 @@ static void control_tick(Motor *m, float dt)
     m->current_pos += n;
 }
 
-/*static int32_t enc_delta(Axis *ax)
-{
-    uint32_t now = __HAL_TIM_GET_COUNTER(ax->enc);
-    int32_t d = ax->is32 ? (int32_t)(now - ax->enc_prev)
-                         : (int16_t)((uint16_t)now - (uint16_t)ax->enc_prev);
-    ax->enc_prev = now;
-    return d;
-}*/
-
-// core clock = 84 MHz → 84 cycles per µs
-static inline void delay_us(uint32_t us)
-{
-    uint32_t start = DWT->CYCCNT;
-    uint32_t ticks = us * 84u;
-    while ((DWT->CYCCNT - start) < ticks);   // unsigned subtraction is wrap-safe
-}
-
-
 /* ============ Encoder homing for M2 / M3 (blocking) ============ */
 
-#define HOME_V         800u   /* microsteps/s during homing */
-#define HOME_WIN       16u    /* microsteps per stall-check window */
-#define HOME_TRIP_PCT  30     /* trip below this % of expected counts */
-#define HOME_ARM       3u     /* windows skipped at move start */
-#define HOME_CONFIRM   2u     /* consecutive bad windows to trip */
-#define HOME_RNUM      25     /* microsteps = counts * 25 / 64 */
-#define HOME_RDEN      64
+#define HOME_NORMAL_CURRENT_MA 500u
+#define HOME_M2_TOUCH_CURRENT_MA 175u
+#define HOME_M3_TOUCH_CURRENT_MA 300u
+#define HOME_APPROACH_V        800u /* slow touch-off */
+#define HOME_RETURN_V          800u
+#define HOME_WIN                16u
+#define HOME_ARM_WINDOWS         3u
+#define HOME_RNUM               25
+#define HOME_RDEN               64
+#define HOME_TRIP_LAG           10
+#define HOME_M2_LIMIT_STEPS    8192u
+#define HOME_M3_LIMIT_STEPS   12288u
+#define HOME_M2_SEAT_STEPS       32u
+#define HOME_M3_SEAT_STEPS        0u
+#define HOME_START_EPS_CNT         4
+#define HOME_RETURN_TOL_CNT      2
+#define HOME_RETURN_MARGIN      64u
+
+/* CAD angles are stored in 0.1 degree units so homing uses no float math. */
+#define HOME_M2_OFFSET_DEG10   1270u
+#define HOME_M2_TIMEOUT_DEG10  2740u
+#define HOME_M3_OFFSET_DEG10   1327u
+#define HOME_M3_TIMEOUT_DEG10  2650u
 
 typedef struct {
     uint8_t            mi;      /* index into mot[] */
@@ -300,132 +259,238 @@ typedef struct {
     uint8_t            is32;
     int8_t             esign;   /* +1 if CNT rises when motor turns in +dir */
     int8_t             dir;     /* direction toward the hard stop */
-    uint32_t           limit;   /* microsteps; abort if no stall by then */
+    uint16_t            offset_deg10;
+    uint16_t            timeout_deg10;
+    uint32_t            limit_steps;
+    uint16_t            touch_current_ma;
+    uint16_t            seat_steps;
 } HomeAxis;
 
-/*     mi  fenc     is32  esign  dir   limit   */
+/* Document M1 -> firmware M2, document M2 -> firmware M3.
+ * Bench-verified follower wiring: M2=TIM8, M3=TIM5.
+ * Runtime encoder direction: M2 esign=-1, M3 esign=-1.
+ * Until a separate motor-to-drum ratio is measured, the inverse of the
+ * existing output/input ratios is used for motor turns per drum turn:
+ * M2=181/171, M3=70/18.
+ * M3's + HOME_DIR is provisionally paired with the 132.7 degree stop.
+ * If bench jogging shows that + reaches the opposite CAD stop, change only
+ * HOME_M3_OFFSET_DEG10 to 1125 (and keep the direction/offset paired). */
 static const HomeAxis home_ax[2] = {
-    { 1, &htim5, 1, -1, -1, 64000 },   /* M2 - set limit to real travel */
-    { 2, &htim8, 0, +1, +1, 64000 },   /* M3 - set limit to real travel */
+    { 1, &htim8, 0, -1, -1, HOME_M2_OFFSET_DEG10,
+      HOME_M2_TIMEOUT_DEG10, HOME_M2_LIMIT_STEPS,
+      HOME_M2_TOUCH_CURRENT_MA, HOME_M2_SEAT_STEPS },
+    { 2, &htim5, 1, -1, +1, HOME_M3_OFFSET_DEG10,
+      HOME_M3_TIMEOUT_DEG10, HOME_M3_LIMIT_STEPS,
+      HOME_M3_TOUCH_CURRENT_MA, HOME_M3_SEAT_STEPS },
 };
 
-/* 0 = homed, 1 = no stall within limit, 2 = follower encoder not counting */
+typedef enum {
+    HOME_OK = 0,
+    HOME_NO_HARDSTOP,
+    HOME_ENCODER_FAULT,
+    HOME_RETURN_FAULT,
+    HOME_DRIVER_FAULT
+} HomeStatus;
 
-static void home_probe(const HomeAxis *a, uint32_t n_us)
+static uint8_t knob_axes_homed = 0;
+
+static int32_t home_encoder_delta(const HomeAxis *a, uint32_t now, uint32_t prev)
+{
+    return a->is32 ? (int32_t)(now - prev)
+                   : (int16_t)((uint16_t)now - (uint16_t)prev);
+}
+
+static int32_t home_position_from(const HomeAxis *a, uint32_t origin)
+{
+    int32_t delta = home_encoder_delta(a, __HAL_TIM_GET_COUNTER(a->fenc), origin);
+    return delta * a->esign;
+}
+
+static void home_set_direction(const HomeAxis *a, int8_t logical_dir)
 {
     Motor *m = &mot[a->mi];
-    const uint32_t step_cyc = SystemCoreClock / HOME_V;
-    const int32_t  expect = (int32_t)(((int64_t)HOME_WIN * HOME_RDEN) / HOME_RNUM);
-
     HAL_GPIO_WritePin(m->dir_port, m->dir_pin,
-                      (a->dir * m->dir_sign > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    dwt_delay_cycles(SystemCoreClock / 100000u);
+                      (logical_dir * m->dir_sign > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    dwt_delay_cycles(SystemCoreClock / 100000u); /* 10 us DIR setup */
+}
 
+static uint32_t home_deg10_to_steps(const HomeAxis *a, uint16_t deg10)
+{
+    const Motor *m = &mot[a->mi];
+    return (uint32_t)(((int64_t)deg10 * RATIO_NUM * m->gear_den +
+                       (int64_t)3600 * m->gear_num - 1) /
+                      ((int64_t)3600 * m->gear_num));
+}
+
+static int32_t home_deg10_to_counts(const HomeAxis *a, uint16_t deg10)
+{
+    const Motor *m = &mot[a->mi];
+    return (int32_t)(((int64_t)deg10 * ENC_CPR * m->gear_den +
+                      (int64_t)3600 * m->gear_num / 2) /
+                     ((int64_t)3600 * m->gear_num));
+}
+
+static HomeStatus home_move_from_stop_to_alignment(const HomeAxis *a,
+                                                   uint32_t stop_pos)
+{
+    Motor *m = &mot[a->mi];
+    const int32_t target = home_deg10_to_counts(a, a->offset_deg10);
+    const uint32_t return_limit =
+        home_deg10_to_steps(a, a->offset_deg10) + HOME_RETURN_MARGIN;
+    const uint32_t step_cyc = SystemCoreClock / HOME_RETURN_V;
+
+    home_set_direction(a, (int8_t)-a->dir);
     uint32_t t = DWT->CYCCNT;
-    uint32_t prev = __HAL_TIM_GET_COUNTER(a->fenc);
-    uint32_t moved = 0, in_win = 0, win_n = 0;
 
-    printf("[PROBE M%d] dir=%d esign=%d expect=%ld trip=%ld cnt0=%lu\r\n",
-           a->mi + 1, (int)a->dir, (int)a->esign,
-           (long)expect, (long)(expect * HOME_TRIP_PCT / 100),
-           (unsigned long)prev);
+    for (uint32_t moved = 0; moved < return_limit; moved++) {
+        int32_t away = -home_position_from(a, stop_pos) * a->dir;
+        if (away >= target - HOME_RETURN_TOL_CNT) {
+            return HOME_OK;
+        }
 
-    while (moved < n_us) {
-        while ((uint32_t)(DWT->CYCCNT - t) < step_cyc) { }
-        t += step_cyc;
-        step_pulse(m->step_port, m->step_pin);
-        moved++;
-        if (++in_win < HOME_WIN) continue;
-        in_win = 0;
-
-        uint32_t now = __HAL_TIM_GET_COUNTER(a->fenc);
-        int32_t d = a->is32 ? (int32_t)(now - prev)
-                            : (int16_t)((uint16_t)now - (uint16_t)prev);
-        prev = now;
-        printf("w%02lu d=%+ld adv=%+ld\r\n", (unsigned long)++win_n,
-               (long)d, (long)(d * a->esign * a->dir));
-        t = DWT->CYCCNT;   /* re-anchor; printf consumed time */
-    }
-}
-
-static void home_probe2(uint8_t mi, GPIO_PinState dirlevel, uint32_t n_us)
-{
-    Motor *m = &mot[mi];
-    const uint32_t step_cyc = SystemCoreClock / HOME_V;
-
-    HAL_GPIO_WritePin(m->dir_port, m->dir_pin, dirlevel);
-    dwt_delay_cycles(SystemCoreClock / 100000u);
-
-    uint32_t p5 = __HAL_TIM_GET_COUNTER(&htim5);
-    uint32_t p8 = __HAL_TIM_GET_COUNTER(&htim8);
-    uint32_t t  = DWT->CYCCNT;
-
-    for (uint32_t i = 0; i < n_us; i++) {
         while ((uint32_t)(DWT->CYCCNT - t) < step_cyc) { }
         t += step_cyc;
         step_pulse(m->step_port, m->step_pin);
     }
 
-    int32_t d5 = (int32_t)(__HAL_TIM_GET_COUNTER(&htim5) - p5);
-    int32_t d8 = (int16_t)((uint16_t)__HAL_TIM_GET_COUNTER(&htim8) - (uint16_t)p8);
-    printf("[P2 M%d dir=%d] steps=%lu  TIM5=%+ld  TIM8=%+ld  expect~4096 on own enc\r\n",
-           mi + 1, (int)dirlevel, (unsigned long)n_us, (long)d5, (long)d8);
+    int32_t away = -home_position_from(a, stop_pos) * a->dir;
+    return (away >= target - HOME_RETURN_TOL_CNT) ?
+           HOME_OK : HOME_RETURN_FAULT;
 }
 
-static int home_one(const HomeAxis *a)
+static HomeStatus home_one(const HomeAxis *a)
 {
     Motor *m = &mot[a->mi];
 
-    const int32_t  expect   = (int32_t)(((int64_t)HOME_WIN * HOME_RDEN) / HOME_RNUM);
-    const int32_t  trip     = (expect * HOME_TRIP_PCT) / 100;
-    const uint32_t step_cyc = SystemCoreClock / HOME_V;
+    const uint32_t approach_limit = a->limit_steps;
+    const uint32_t step_cyc = SystemCoreClock / HOME_APPROACH_V;
 
-    HAL_GPIO_WritePin(m->dir_port, m->dir_pin,
-                      (a->dir * m->dir_sign > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    dwt_delay_cycles(SystemCoreClock / 100000u);      /* 10 us DIR setup */
+    if (TMC2209uart(a->touch_current_ma, MICROSTEP, m->pdn_port,
+                    m->pdn_pin, m->tmc_addr) != TMC_OK) {
+        return HOME_DRIVER_FAULT;
+    }
+
+    home_set_direction(a, a->dir);
 
     uint32_t t      = DWT->CYCCNT;
     uint32_t prev   = __HAL_TIM_GET_COUNTER(a->fenc);
-    uint32_t moved  = 0, in_win = 0, win_n = 0;
-    uint8_t  bad    = 0;
-    int      tripped = 0;
+    uint32_t moved  = 0, in_window = 0, window_n = 0;
+    int64_t  advanced_counts = 0;
+    int64_t  lag0 = 0;
+    int64_t  lag_delta = 0;
+    int64_t  max_lag_delta = 0;
+    uint8_t  tripped = 0;
 
-    while (moved < a->limit) {
+    while (moved < approach_limit) {
         while ((uint32_t)(DWT->CYCCNT - t) < step_cyc) { }
         t += step_cyc;
         step_pulse(m->step_port, m->step_pin);
         moved++;
 
-        if (++in_win < HOME_WIN) continue;
-        in_win = 0;
+        if (++in_window < HOME_WIN) continue;
+        in_window = 0;
 
         uint32_t now = __HAL_TIM_GET_COUNTER(a->fenc);
-        int32_t  d   = a->is32 ? (int32_t)(now - prev)
-                               : (int16_t)((uint16_t)now - (uint16_t)prev);
+        int32_t  d   = home_encoder_delta(a, now, prev);
         prev = now;
         int32_t adv = d * a->esign * a->dir;   /* >0 when advancing to the stop */
+        advanced_counts += adv;
 
-        if (++win_n <= HOME_ARM) continue;
-        if (win_n == HOME_ARM + 1u && adv <= 0) return 2;
+        window_n++;
+        int64_t expected_counts =
+            ((int64_t)moved * HOME_RDEN) / HOME_RNUM;
+        int64_t lag = expected_counts - advanced_counts;
 
-        if (adv < trip) { if (++bad >= HOME_CONFIRM) { tripped = 1; break; } }
-        else            { bad = 0; }
+        if (window_n == HOME_ARM_WINDOWS) {
+            printf("[HOME] M%d arm advanced=%ld\r\n",
+                   a->mi + 1, (long)advanced_counts);
+            if (advanced_counts >= -HOME_START_EPS_CNT &&
+                advanced_counts <=  HOME_START_EPS_CNT) {
+                printf("[HOME] M%d already at stop\r\n", a->mi + 1);
+                tripped = 1;
+                break;
+            }
+            if (advanced_counts < -HOME_START_EPS_CNT) {
+                (void)TMC2209uart(HOME_NORMAL_CURRENT_MA, MICROSTEP,
+                                  m->pdn_port, m->pdn_pin, m->tmc_addr);
+                printf("[HOME] M%d encoder-dir advanced=%ld\r\n",
+                       a->mi + 1, (long)advanced_counts);
+                return HOME_ENCODER_FAULT;
+            }
+            lag0 = lag;
+            continue;
+        }
+        if (window_n < HOME_ARM_WINDOWS) continue;
+
+        lag_delta = lag - lag0;
+        if (lag_delta > max_lag_delta) max_lag_delta = lag_delta;
+        if (advanced_counts < 0) {
+            (void)TMC2209uart(HOME_NORMAL_CURRENT_MA, MICROSTEP, m->pdn_port,
+                              m->pdn_pin, m->tmc_addr);
+            printf("[HOME] M%d encoder-dir advanced=%ld\r\n",
+                   a->mi + 1, (long)advanced_counts);
+            return HOME_ENCODER_FAULT;
+        }
+        if (lag_delta >= HOME_TRIP_LAG) {
+            printf("[HOME] M%d stop detected moved=%lu lag=%ld\r\n",
+                   a->mi + 1, (unsigned long)moved, (long)lag_delta);
+            tripped = 1;
+            break;
+        }
     }
-    if (!tripped) return 1;
 
+    if (!tripped) {
+        (void)TMC2209uart(HOME_NORMAL_CURRENT_MA, MICROSTEP, m->pdn_port,
+                          m->pdn_pin, m->tmc_addr);
+        printf("[HOME] M%d no-stop moved=%lu lag=%ld max-lag=%ld\r\n",
+               a->mi + 1, (unsigned long)moved,
+               (long)lag_delta, (long)max_lag_delta);
+        return HOME_NO_HARDSTOP;
+    }
+
+    /* Seat M2 gently against the hard stop for a short, bounded interval
+       before capturing STOP_POS. M3 currently uses zero seating steps. */
+    t = DWT->CYCCNT;
+    for (uint16_t i = 0; i < a->seat_steps; i++) {
+        while ((uint32_t)(DWT->CYCCNT - t) < step_cyc) { }
+        t += step_cyc;
+        step_pulse(m->step_port, m->step_pin);
+    }
+
+    uint32_t stop_pos = __HAL_TIM_GET_COUNTER(a->fenc);
+
+    /* Touch-off uses reduced current, but pull away from the mechanical stop
+       at normal current so gearbox friction cannot leave the axis stuck. */
+    if (TMC2209uart(HOME_NORMAL_CURRENT_MA, MICROSTEP, m->pdn_port,
+                    m->pdn_pin, m->tmc_addr) != TMC_OK) {
+        return HOME_DRIVER_FAULT;
+    }
+
+    HomeStatus status = home_move_from_stop_to_alignment(a, stop_pos);
+    if (status != HOME_OK) return status;
+
+    /* The CAD alignment pose, not the power-on pose, is the logical zero. */
     m->current_pos = 0;
     m->target_pos  = 0;
     m->accum_num   = 0;
     m->vel         = 0.0f;
     m->emit_accum  = 0.0f;
     __HAL_TIM_SET_COUNTER(a->fenc, 0);
-    return 0;
+    return HOME_OK;
 }
 
-int home_m2_m3(void)
+static HomeStatus home_m2_m3(void)
 {
-    int r = 0;
-    for (int i = 0; i < 2; i++) { int e = home_one(&home_ax[i]); if (e) r = e; }
+    knob_axes_homed = 0;
+    for (int i = 0; i < 2; i++) {
+        HomeStatus status = home_one(&home_ax[i]);
+        if (status != HOME_OK) {
+            printf("[HOME] M%d failed, status=%d\r\n",
+                   home_ax[i].mi + 1, (int)status);
+            return status;
+        }
+        printf("[HOME] M%d aligned\r\n", home_ax[i].mi + 1);
+    }
 
     /* Required. The input encoders kept counting in hardware while this
        blocked. Without the resync the next control_tick sees the whole
@@ -433,9 +498,9 @@ int home_m2_m3(void)
     for (int i = 0; i < 4; i++)
         in_enc[i].prev = __HAL_TIM_GET_COUNTER(in_enc[i].tim);
 
-    return r;
+    knob_axes_homed = 1;
+    return HOME_OK;
 }
-
 
 /* USER CODE END 0 */
 
@@ -481,7 +546,7 @@ int main(void)
         HAL_GPIO_WritePin(mot[m].en_port, mot[m].en_pin, GPIO_PIN_SET);
 
 
-  dwt_delay_init();   /* MUST run before any m1_step_pulse() — enables DWT->CYCCNT */
+  dwt_delay_init();   /* MUST run before any m1_step_pulse() ??enables DWT->CYCCNT */
     HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL);
     HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
     HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
@@ -502,29 +567,25 @@ int main(void)
 
     HAL_Delay(10);
 
+    printf("[FW] HOME_REV=20260730_04\r\n");
+
     /* 3. Configure; enable ONLY drivers whose config verified */
     for (int m = 0; m < N_MOT; m++) {
         TMC_Status_t st = TMC2209uart(500, MICROSTEP,
                                       mot[m].pdn_port, mot[m].pdn_pin, mot[m].tmc_addr);
         if (st == TMC_OK)
             HAL_GPIO_WritePin(mot[m].en_port, mot[m].en_pin, GPIO_PIN_RESET);
-        else
-            printf("[MAIN] M%d config FAILED (code=%d) - left disabled\r\n", m + 1, (int)st);
 
-        HAL_Delay(1000);
+        HAL_Delay(10);
     }
 
+    if (home_m2_m3() != HOME_OK) {
+        for (int m = 0; m < N_MOT; m++)
+            HAL_GPIO_WritePin(mot[m].en_port, mot[m].en_pin, GPIO_PIN_SET);
+        Error_Handler();
+    }
 
-    acc_steps =0; // reset accumulated steps.
     uint32_t last_cyc = DWT->CYCCNT;
-
-   volatile int home_err = home_m2_m3();   /* 0=ok 1=no stall 2=encoder dead */
-
-    //home_probe2(1, GPIO_PIN_SET,   1600);  HAL_Delay(500);
-      //home_probe2(1, GPIO_PIN_RESET, 1600);  HAL_Delay(500);
-     // home_probe2(2, GPIO_PIN_SET,   1600);  HAL_Delay(500);
-      //home_probe2(2, GPIO_PIN_RESET, 1600);
-
 
    /* USER CODE END 2 */
 
@@ -535,6 +596,12 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+      if (!knob_axes_homed) {
+          for (int m = 0; m < N_MOT; m++)
+              HAL_GPIO_WritePin(mot[m].en_port, mot[m].en_pin, GPIO_PIN_SET);
+          Error_Handler();
+      }
+
 	  /* --- dt since last tick, exact from DWT (wrap-safe unsigned sub) --- */
 	  uint32_t now_cyc = DWT->CYCCNT;
 	      float dt = (float)(now_cyc - last_cyc) / (float)SystemCoreClock;
@@ -585,25 +652,6 @@ int main(void)
 	      	  control_tick(&mot[m], dt);
 	      }
 
-	      /* main.c — inside while(1), diagnosis only, remove afterwards.
-	       * Each read blocks ~1-2 ms with IRQs off + printf blocks: motors WILL stutter every 2 s. */
-	      /*
-	      static uint32_t last_diag = 0;
-	      if (HAL_GetTick() - last_diag >= 2000) {
-	          last_diag = HAL_GetTick();
-	          uint32_t gstat = 0, gconf = 0, ifcnt = 0;
-	          TMC_Status_t r1 = tmc_diag_read(GPIOB, GPIO_PIN_1, 0, 0x01, &gstat);
-	          TMC_Status_t r2 = tmc_diag_read(GPIOB, GPIO_PIN_1, 0, 0x00, &gconf);
-	          TMC_Status_t r3 = tmc_diag_read(GPIOB, GPIO_PIN_1, 0, 0x02, &ifcnt);
-	          printf("[M5] GSTAT: code=%d val=0x%02lX | GCONF: code=%d val=0x%08lX | IFCNT: code=%d val=%lu\r\n",
-	                 (int)r1, (unsigned long)gstat,
-	                 (int)r2, (unsigned long)gconf,
-	                 (int)r3, (unsigned long)(ifcnt & 0xFFu));
-	      }
-	      */
-
-	      //delay_us(1000);
-	      //HAL_Delay(1);
   }
   /* USER CODE END 3 */
 }
@@ -1163,3 +1211,4 @@ void assert_failed(uint8_t *file, uint32_t line)
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
+
