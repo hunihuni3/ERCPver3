@@ -27,8 +27,6 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-int acc_steps = 0;
-
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -37,17 +35,10 @@ int acc_steps = 0;
 #define MICROSTEP 16
 #define CPR 2048
 
-/* --- Motor 1 pin macros (open-drain not needed here; STEP/DIR are push-pull) */
-#define M1_STEP_PORT   GPIOC
-#define M1_STEP_PIN    GPIO_PIN_1
-#define M1_DIR_PORT    GPIOC
-#define M1_DIR_PIN     GPIO_PIN_2
-#define M1_EN_PORT     GPIOC
-#define M1_EN_PIN      GPIO_PIN_0
-
-/* TMC2209 enable is ACTIVE LOW: drive EN low to energise the driver. */
-#define M1_DRIVER_ENABLE()   HAL_GPIO_WritePin(M1_EN_PORT, M1_EN_PIN, GPIO_PIN_RESET)
-#define M1_DRIVER_DISABLE()  HAL_GPIO_WritePin(M1_EN_PORT, M1_EN_PIN, GPIO_PIN_SET)
+/* Temporary bench mode:
+ * 1 = keep M2/M3 disabled, skip their homing, and run M1/M4/M5 only.
+ * 0 = restore the complete machine including mandatory M2/M3 homing. */
+#define M45_ONLY_TEST_MODE 1u
 
 /* Exact counts->microsteps ratio.
  *   3200 microsteps/rev  /  8192 enc counts/rev  =  25/64  (exact)
@@ -59,16 +50,6 @@ int acc_steps = 0;
 
 /* STEP pulse high time, in CPU cycles. At 168 MHz, 168 cycles ~= 1 us. */
 #define STEP_PULSE_CYCLES    (SystemCoreClock / 1000000u)
-
-/* How often to emit a debug line, in milliseconds (does NOT throttle stepping) */
-#define DEBUG_PRINT_PERIOD_MS  50u
-
-/* file-scope state for the follow loop */
-//static int32_t  enc_prev      = 0;     /* last TIM2 count we saw            */			//all obsolete now they live in the multi stepper struct now..
-//static int64_t  step_accum_num = 0;    /* fractional-step accumulator       */
-                                       /* (numerator units; /RATIO_DEN = us) */
-extern TIM_HandleTypeDef htim2;        /* CubeMX-generated handle           */
-
 
 /* USER CODE END PD */
 
@@ -107,12 +88,11 @@ static void MX_USART2_UART_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-char tx_buf[64];
 #include <stdio.h>
-#include <stdlib.h>
 
 int _write(int file, char *ptr, int len)
 {
+    (void)file;
     HAL_UART_Transmit(&huart2, (uint8_t*)ptr, len, HAL_MAX_DELAY);
     return len;
 }
@@ -128,20 +108,15 @@ typedef enum {
 
     TOOL_CATHETER = 0,
 
-    TOOL_GUIDE = 1
+    TOOL_GUIDE = 1,
+
+    TOOL_CATHETER_RETRACT_WIRE_HOLD = 2
 
 } Tool;
 
 volatile Mode current_mode = MODE_PRECISION; 					// MODE_PRECISION is just 1:1 matching mode. encoders turned out to be accurate enough to just 1:1 match.
-//Mode current_mode = MODE_FAST;
 
 volatile Tool current_tool = TOOL_CATHETER;
-//
-uint8_t rx;  // UART 입력용
-
-//int32_t target_pos = 0;   			// obsolete
-
-
 
 /* DWT cycle counter init — call once before the loop. Used for the ~1us pulse. */
 static void dwt_delay_init(void)
@@ -166,13 +141,6 @@ static inline void step_pulse(GPIO_TypeDef *port, uint16_t pin)
     HAL_GPIO_WritePin(port, pin, GPIO_PIN_RESET);
     dwt_delay_cycles(STEP_PULSE_CYCLES);
 }
-
-//Trapezoidal position follower position error law implementation
-//static int32_t current_pos = 0; //microsteps actually emitted
-//static float vel = 0.0f; //signed steps/s persists per tick
-//tatic float emit_accum = 0.0f; //fractional step carry for emissio
-//above are all obsolete and lives in struct
-
 
 #define V_MAX 51200.0f //steps/s ceiling
 #define A_MAX 160000.0f //steps/s^2 max
@@ -215,6 +183,9 @@ typedef struct {
 } Motor;
 
 #define N_MOT 5
+#define TMC_INIT_RETRIES 3u
+#define TMC_INIT_RETRY_DELAY_MS 100u
+#define TMC_INIT_AXIS_DELAY_MS 1000u
 
 /* STEP/DIR/EN below are read from your schematic and are confident.
  * pdn_pin for M3/M4/M5 and all tmc_addr are NOT — see confirm-list. */
@@ -222,17 +193,74 @@ typedef struct {
 // gain_en determines if motor is subject to gain variation by gain button; only enable for feeder, not position tracking knobs.
 // gear D is input gear, gearN is output gear.
 static Motor mot[N_MOT] = {
-  /* step               dir                en                pdn(TMC)          addr gain_en gearN gearD* dir_sign */
-  { GPIOC,GPIO_PIN_1,  GPIOC,GPIO_PIN_2,  GPIOC,GPIO_PIN_0,  GPIOB,GPIO_PIN_0,  0 , 0 , 95 , 26 , -1}, /* M1 PDN_UART1=PB0 */
-  { GPIOC,GPIO_PIN_4,  GPIOC,GPIO_PIN_5,  GPIOC,GPIO_PIN_3,  GPIOB,GPIO_PIN_0,  1 , 0,  171 , 181 , +1}, /* M2 PDN_UART2=PB0 */
-  { GPIOC,GPIO_PIN_9,  GPIOC,GPIO_PIN_10, GPIOC,GPIO_PIN_8,  GPIOB,GPIO_PIN_0,  2 , 0 , 18 , 70 , +1}, /* M3 PDN_UART3=PB0 */
-  { GPIOC,GPIO_PIN_12, GPIOC,GPIO_PIN_13, GPIOC,GPIO_PIN_11, GPIOB,GPIO_PIN_0,  3 , 1 , 1 , 1 , +1}, /* M4 PDN_UART4=PB0 */
-  { GPIOA,GPIO_PIN_11, GPIOD,GPIO_PIN_2,  GPIOA,GPIO_PIN_12, GPIOB,GPIO_PIN_1,  0 , 1 , 1 , 1 , +1}, /* M5 PDN_UART5=PB1  */
+  /* step               dir                en                pdn(TMC)          addr gain gearN gearD sign runtime state */
+  { GPIOC,GPIO_PIN_1,  GPIOC,GPIO_PIN_2,  GPIOC,GPIO_PIN_0,  GPIOB,GPIO_PIN_0,  0, 0,  95,  26, -1, 0, 0, 0, 0.0f, 0.0f },
+  { GPIOC,GPIO_PIN_4,  GPIOC,GPIO_PIN_5,  GPIOC,GPIO_PIN_3,  GPIOB,GPIO_PIN_0,  1, 0, 27803, 100000, +1, 0, 0, 0, 0.0f, 0.0f },
+  { GPIOC,GPIO_PIN_9,  GPIOC,GPIO_PIN_10, GPIOC,GPIO_PIN_8,  GPIOB,GPIO_PIN_0,  2, 0, 25961, 100000, +1, 0, 0, 0, 0.0f, 0.0f },
+  { GPIOC,GPIO_PIN_12, GPIOC,GPIO_PIN_13, GPIOC,GPIO_PIN_11, GPIOB,GPIO_PIN_0,  3, 1,   1,   1, +1, 0, 0, 0, 0.0f, 0.0f },
+  { GPIOA,GPIO_PIN_11, GPIOD,GPIO_PIN_2,  GPIOA,GPIO_PIN_12, GPIOB,GPIO_PIN_1,  0, 1,   1,   1, +1, 0, 0, 0, 0.0f, 0.0f },
 };
 
-/* enc4 routes to exactly one of M4/M5 at a time */
-typedef enum { SEL_M4 = 0, SEL_M5 = 1 } Enc4Sel;
+/* A driver remains disabled unless its UART configuration was verified. */
+static uint8_t motor_ready[N_MOT] = {0};
+
+static uint8_t motor_enabled_for_mode(uint8_t mi)
+{
+#if M45_ONLY_TEST_MODE
+    if (mi == 1u || mi == 2u) return 0u; /* M2/M3 */
+#endif
+    return 1u;
+}
+
+/* In coupled mode M5 receives the opposite logical command. Change this to
+ * +1 only if the installed roller geometry requires the same motor direction
+ * to produce opposite catheter/wire travel. */
+#define COUPLED_M5_ENCODER_SIGN (-1)
+
+typedef enum {
+    SEL_M4 = 0,
+    SEL_M5 = 1,
+    SEL_M4_M5_OPPOSED = 2
+} Enc4Sel;
 static volatile Enc4Sel enc4_sel = SEL_M4;   /* set by your button */
+
+static const char *enc4_selection_name(Enc4Sel selection)
+{
+    switch (selection) {
+    case SEL_M4: return "M4 catheter";
+    case SEL_M5: return "M5 guidewire";
+    case SEL_M4_M5_OPPOSED: return "M4/M5 opposed";
+    default: return "unknown";
+    }
+}
+
+static uint8_t motor_driver_init(uint8_t mi)
+{
+    Motor *m = &mot[mi];
+
+    motor_ready[mi] = 0u;
+    HAL_GPIO_WritePin(m->en_port, m->en_pin, GPIO_PIN_SET);
+
+    for (uint32_t attempt = 1u; attempt <= TMC_INIT_RETRIES; attempt++) {
+        TMC_Status_t st = TMC2209uart(500, MICROSTEP,
+                                     m->pdn_port, m->pdn_pin, m->tmc_addr);
+        if (st == TMC_OK) {
+            motor_ready[mi] = 1u;
+            HAL_GPIO_WritePin(m->en_port, m->en_pin, GPIO_PIN_RESET);
+            printf("[MAIN] M%d driver ready attempt=%lu EN=0\r\n",
+                   mi + 1, (unsigned long)attempt);
+            return 1u;
+        }
+
+        printf("[MAIN] M%d config failed attempt=%lu code=%d\r\n",
+               mi + 1, (unsigned long)attempt, (int)st);
+        HAL_Delay(TMC_INIT_RETRY_DELAY_MS);
+    }
+
+    printf("[MAIN] M%d disabled after %u attempts\r\n",
+           mi + 1, (unsigned int)TMC_INIT_RETRIES);
+    return 0u;
+}
 
 static void control_tick(Motor *m, float dt)
 {
@@ -266,900 +294,140 @@ static void control_tick(Motor *m, float dt)
     m->current_pos += n;
 }
 
-/*static int32_t enc_delta(Axis *ax)
-{
-    uint32_t now = __HAL_TIM_GET_COUNTER(ax->enc);
-    int32_t d = ax->is32 ? (int32_t)(now - ax->enc_prev)
-                         : (int16_t)((uint16_t)now - (uint16_t)ax->enc_prev);
-    ax->enc_prev = now;
-    return d;
-}*/
-
-// core clock = 84 MHz → 84 cycles per µs
-static inline void delay_us(uint32_t us)
-{
-    uint32_t start = DWT->CYCCNT;
-    uint32_t ticks = us * 84u;
-    while ((DWT->CYCCNT - start) < ticks);   // unsigned subtraction is wrap-safe
-}
-
-
 /* ============ Encoder homing for M2 / M3 (blocking) ============ */
 
-#define HOME_V         800u   /* microsteps/s during homing */
-#define HOME_WIN       16u    /* microsteps per stall-check window */
-#define HOME_TRIP_PCT  30     /* trip below this % of expected counts */
-#define HOME_ARM       3u     /* windows skipped at move start */
-#define HOME_CONFIRM   2u     /* consecutive bad windows to trip */
-#define HOME_RNUM      25     /* microsteps = counts * 25 / 64 */
-#define HOME_RDEN      64
+#define HOME_NORMAL_CURRENT_MA 500u
+#define HOME_M2_TOUCH_CURRENT_MA 175u
+#define HOME_M3_TOUCH_CURRENT_MA 300u
+#define HOME_APPROACH_V        800u /* slow touch-off */
+#define HOME_RETURN_V          800u
+#define HOME_WIN                16u
+#define HOME_ARM_WINDOWS         3u
+#define HOME_RNUM               25
+#define HOME_RDEN               64
+#define HOME_TRIP_LAG           80
+#define HOME_CONFIRM_WINDOWS     2u
+#define HOME_SECOND_ARM_COUNTS 6000
+#define HOME_M2_LIMIT_STEPS   12000u
+#define HOME_M3_LIMIT_STEPS   12288u
+#define HOME_M2_SEAT_STEPS       32u
+#define HOME_M3_SEAT_STEPS        0u
+#define HOME_START_EPS_CNT         4
+#define HOME_RETURN_TOL_CNT      2
+#define HOME_RETURN_MARGIN      64u
+#define HOME_MIN_SPAN_CNT      12000
+#define HOME_MAX_SPAN_CNT      30000
+
+/* CAD angles are stored in 0.1 degree units so homing uses no float math. */
+#define HOME_M2_SPAN_DEG10           2539u
+#define HOME_M2_RETURN2_DEG10        1390u
+#define HOME_M3_SPAN_DEG10           2452u
+#define HOME_M3_RETURN2_DEG10        1383u
 
 typedef struct {
     uint8_t            mi;      /* index into mot[] */
     TIM_HandleTypeDef *fenc;
     uint8_t            is32;
     int8_t             esign;   /* +1 if CNT rises when motor turns in +dir */
-    int8_t             dir;     /* direction toward the hard stop */
-    uint32_t           limit;   /* microsteps; abort if no stall by then */
+    int8_t             first_dir;
+    uint16_t            span_deg10;
+    uint16_t            return2_deg10;
+    uint32_t            limit_steps;
+    uint16_t            touch_current_ma;
+    uint16_t            seat_steps;
 } HomeAxis;
 
-/*     mi  fenc     is32  esign  dir   limit   */
+/* Document M1 -> firmware M2, document M2 -> firmware M3.
+ * Bench-verified follower wiring: M2=TIM8, M3=TIM5.
+ * Runtime encoder direction: M2 esign=-1, M3 esign=-1.
+ * Each axis touches the first stop, traverses to the opposite stop, measures
+ * the actual encoder span, then returns from the second stop by the CAD ratio.
+ * M3 first_dir=+ reaches the 132.7-degree side, so the return from the second
+ * stop is 112.5 degrees. */
 static const HomeAxis home_ax[2] = {
-    { 1, &htim5, 1, -1, -1, 64000 },   /* M2 - set limit to real travel */
-    { 2, &htim8, 0, +1, +1, 64000 },   /* M3 - set limit to real travel */
+    { 1, &htim8, 0, -1, -1, HOME_M2_SPAN_DEG10,
+      HOME_M2_RETURN2_DEG10, HOME_M2_LIMIT_STEPS,
+      HOME_M2_TOUCH_CURRENT_MA, HOME_M2_SEAT_STEPS },
+    { 2, &htim5, 1, -1, +1, HOME_M3_SPAN_DEG10,
+      HOME_M3_RETURN2_DEG10, HOME_M3_LIMIT_STEPS,
+      HOME_M3_TOUCH_CURRENT_MA, HOME_M3_SEAT_STEPS },
 };
 
-/* 0 = homed, 1 = no stall within limit, 2 = follower encoder not counting */
+typedef enum {
+    HOME_OK = 0,
+    HOME_NO_HARDSTOP,
+    HOME_ENCODER_FAULT,
+    HOME_SPAN_FAULT,
+    HOME_RETURN_FAULT,
+    HOME_DRIVER_FAULT
+} HomeStatus;
 
-static void home_probe(const HomeAxis *a, uint32_t n_us)
+static uint8_t knob_axes_homed = 0;
+
+static int32_t home_encoder_delta(const HomeAxis *a, uint32_t now, uint32_t prev)
+{
+    return a->is32 ? (int32_t)(now - prev)
+                   : (int16_t)((uint16_t)now - (uint16_t)prev);
+}
+
+static int32_t home_position_from(const HomeAxis *a, uint32_t origin)
+{
+    int32_t delta = home_encoder_delta(a, __HAL_TIM_GET_COUNTER(a->fenc), origin);
+    return delta * a->esign;
+}
+
+static void home_set_direction(const HomeAxis *a, int8_t logical_dir)
 {
     Motor *m = &mot[a->mi];
-    const uint32_t step_cyc = SystemCoreClock / HOME_V;
-    const int32_t  expect = (int32_t)(((int64_t)HOME_WIN * HOME_RDEN) / HOME_RNUM);
-
     HAL_GPIO_WritePin(m->dir_port, m->dir_pin,
-                      (a->dir * m->dir_sign > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    dwt_delay_cycles(SystemCoreClock / 100000u);
-
-    uint32_t t = DWT->CYCCNT;
-    uint32_t prev = __HAL_TIM_GET_COUNTER(a->fenc);
-    uint32_t moved = 0, in_win = 0, win_n = 0;
-
-    printf("[PROBE M%d] dir=%d esign=%d expect=%ld trip=%ld cnt0=%lu\r\n",
-           a->mi + 1, (int)a->dir, (int)a->esign,
-           (long)expect, (long)(expect * HOME_TRIP_PCT / 100),
-           (unsigned long)prev);
-
-    while (moved < n_us) {
-        while ((uint32_t)(DWT->CYCCNT - t) < step_cyc) { }
-        t += step_cyc;
-        step_pulse(m->step_port, m->step_pin);
-        moved++;
-        if (++in_win < HOME_WIN) continue;
-        in_win = 0;
-
-        uint32_t now = __HAL_TIM_GET_COUNTER(a->fenc);
-        int32_t d = a->is32 ? (int32_t)(now - prev)
-                            : (int16_t)((uint16_t)now - (uint16_t)prev);
-        prev = now;
-        printf("w%02lu d=%+ld adv=%+ld\r\n", (unsigned long)++win_n,
-               (long)d, (long)(d * a->esign * a->dir));
-        t = DWT->CYCCNT;   /* re-anchor; printf consumed time */
-    }
+                      (logical_dir * m->dir_sign > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
+    dwt_delay_cycles(SystemCoreClock / 100000u); /* 10 us DIR setup */
 }
 
-static void home_probe2(uint8_t mi, GPIO_PinState dirlevel, uint32_t n_us)
+typedef struct {
+    uint32_t stop_pos;
+    uint32_t moved_steps;
+} HomeStop;
+
+typedef struct {
+    uint32_t prev;
+    uint32_t moved;
+    uint32_t in_window;
+    uint32_t window_n;
+    int64_t  advanced_counts;
+    int64_t  lag0;
+    int64_t  lag_delta;
+    int64_t  max_lag_delta;
+    uint8_t  tripped;
+    uint8_t  detection_armed;
+    uint8_t  confirm;
+} HomeSeekState;
+
+static HomeStatus home_set_axis_currents(uint8_t touch_mode)
 {
-    Motor *m = &mot[mi];
-    const uint32_t step_cyc = SystemCoreClock / HOME_V;
-
-    HAL_GPIO_WritePin(m->dir_port, m->dir_pin, dirlevel);
-    dwt_delay_cycles(SystemCoreClock / 100000u);
-
-    uint32_t p5 = __HAL_TIM_GET_COUNTER(&htim5);
-    uint32_t p8 = __HAL_TIM_GET_COUNTER(&htim8);
-    uint32_t t  = DWT->CYCCNT;
-
-    for (uint32_t i = 0; i < n_us; i++) {
-        while ((uint32_t)(DWT->CYCCNT - t) < step_cyc) { }
-        t += step_cyc;
-        step_pulse(m->step_port, m->step_pin);
-    }
-
-    int32_t d5 = (int32_t)(__HAL_TIM_GET_COUNTER(&htim5) - p5);
-    int32_t d8 = (int16_t)((uint16_t)__HAL_TIM_GET_COUNTER(&htim8) - (uint16_t)p8);
-    printf("[P2 M%d dir=%d] steps=%lu  TIM5=%+ld  TIM8=%+ld  expect~4096 on own enc\r\n",
-           mi + 1, (int)dirlevel, (unsigned long)n_us, (long)d5, (long)d8);
-}
-
-static int home_one(const HomeAxis *a)
-{
-    Motor *m = &mot[a->mi];
-
-    const int32_t  expect   = (int32_t)(((int64_t)HOME_WIN * HOME_RDEN) / HOME_RNUM);
-    const int32_t  trip     = (expect * HOME_TRIP_PCT) / 100;
-    const uint32_t step_cyc = SystemCoreClock / HOME_V;
-
-    HAL_GPIO_WritePin(m->dir_port, m->dir_pin,
-                      (a->dir * m->dir_sign > 0) ? GPIO_PIN_SET : GPIO_PIN_RESET);
-    dwt_delay_cycles(SystemCoreClock / 100000u);      /* 10 us DIR setup */
-
-    uint32_t t      = DWT->CYCCNT;
-    uint32_t prev   = __HAL_TIM_GET_COUNTER(a->fenc);
-    uint32_t moved  = 0, in_win = 0, win_n = 0;
-    uint8_t  bad    = 0;
-    int      tripped = 0;
-
-    while (moved < a->limit) {
-        while ((uint32_t)(DWT->CYCCNT - t) < step_cyc) { }
-        t += step_cyc;
-        step_pulse(m->step_port, m->step_pin);
-        moved++;
-
-        if (++in_win < HOME_WIN) continue;
-        in_win = 0;
-
-        uint32_t now = __HAL_TIM_GET_COUNTER(a->fenc);
-        int32_t  d   = a->is32 ? (int32_t)(now - prev)
-                               : (int16_t)((uint16_t)now - (uint16_t)prev);
-        prev = now;
-        int32_t adv = d * a->esign * a->dir;   /* >0 when advancing to the stop */
-
-        if (++win_n <= HOME_ARM) continue;
-        if (win_n == HOME_ARM + 1u && adv <= 0) return 2;
-
-        if (adv < trip) { if (++bad >= HOME_CONFIRM) { tripped = 1; break; } }
-        else            { bad = 0; }
-    }
-    if (!tripped) return 1;
-
-    m->current_pos = 0;
-    m->target_pos  = 0;
-    m->accum_num   = 0;
-    m->vel         = 0.0f;
-    m->emit_accum  = 0.0f;
-    __HAL_TIM_SET_COUNTER(a->fenc, 0);
-    return 0;
-}
-
-int home_m2_m3(void)
-{
-    int r = 0;
-    for (int i = 0; i < 2; i++) { int e = home_one(&home_ax[i]); if (e) r = e; }
-
-    /* Required. The input encoders kept counting in hardware while this
-       blocked. Without the resync the next control_tick sees the whole
-       accumulated knob delta at once and commands a burst move. */
-    for (int i = 0; i < 4; i++)
-        in_enc[i].prev = __HAL_TIM_GET_COUNTER(in_enc[i].tim);
-
-    return r;
-}
-
-
-/* USER CODE END 0 */
-
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
-int main(void)
-{
-
-  /* USER CODE BEGIN 1 */
-
-  /* USER CODE END 1 */
-
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
-  HAL_Init();
-
-  /* USER CODE BEGIN Init */
-
-  /* USER CODE END Init */
-
-  /* Configure the system clock */
-  SystemClock_Config();
-
-  /* USER CODE BEGIN SysInit */
-
-  /* USER CODE END SysInit */
-
-  /* Initialize all configured peripherals */
-  MX_GPIO_Init();
-  MX_TIM1_Init();
-  MX_TIM2_Init();
-  MX_TIM3_Init();
-  MX_TIM4_Init();
-  MX_TIM5_Init();
-  MX_TIM8_Init();
-  MX_USART2_UART_Init();
-  /* USER CODE BEGIN 2 */
-  /* first thing: all drivers OFF (EN active-low) */
-    for (int m = 0; m < N_MOT; m++)
-        HAL_GPIO_WritePin(mot[m].en_port, mot[m].en_pin, GPIO_PIN_SET);
-
-
-  dwt_delay_init();   /* MUST run before any m1_step_pulse() — enables DWT->CYCCNT */
-    HAL_TIM_Encoder_Start(&htim1, TIM_CHANNEL_ALL);
-    HAL_TIM_Encoder_Start(&htim2, TIM_CHANNEL_ALL);
-    HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
-    HAL_TIM_Encoder_Start(&htim4, TIM_CHANNEL_ALL);
-    HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
-    HAL_TIM_Encoder_Start(&htim8, TIM_CHANNEL_ALL);
-    for (int i = 0; i < 4; i++) { __HAL_TIM_SET_COUNTER(in_enc[i].tim, 0); in_enc[i].prev = 0; }
-
-    HAL_Delay(100); //wait for VMOT to rise, without this TMC drivers fail to init.--> fixed bug in code that caused drivers to drive full 1.7A at boot.
-
-
-
-    /* SENDDELAY=2 (3*8 bit times) on every node BEFORE any read access.
-     * Datasheet 4.1.2: default (8 bit times) must not be used multi-node. */
-    for (int m = 0; m < N_MOT; m++) {
-        tmc_write_nodeconf(mot[m].pdn_port, mot[m].pdn_pin, mot[m].tmc_addr, 2);
-    }
-
-    HAL_Delay(10);
-
-    /* 3. Configure; enable ONLY drivers whose config verified */
-    for (int m = 0; m < N_MOT; m++) {
-        TMC_Status_t st = TMC2209uart(500, MICROSTEP,
-                                      mot[m].pdn_port, mot[m].pdn_pin, mot[m].tmc_addr);
-        if (st == TMC_OK)
-            HAL_GPIO_WritePin(mot[m].en_port, mot[m].en_pin, GPIO_PIN_RESET);
-        else
-            printf("[MAIN] M%d config FAILED (code=%d) - left disabled\r\n", m + 1, (int)st);
-
-        HAL_Delay(1000);
-    }
-
-
-    acc_steps =0; // reset accumulated steps.
-    uint32_t last_cyc = DWT->CYCCNT;
-
-   volatile int home_err = home_m2_m3();   /* 0=ok 1=no stall 2=encoder dead */
-
-    //home_probe2(1, GPIO_PIN_SET,   1600);  HAL_Delay(500);
-      //home_probe2(1, GPIO_PIN_RESET, 1600);  HAL_Delay(500);
-     // home_probe2(2, GPIO_PIN_SET,   1600);  HAL_Delay(500);
-      //home_probe2(2, GPIO_PIN_RESET, 1600);
-
-
-   /* USER CODE END 2 */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
-  while (1)
-  {
-    /* USER CODE END WHILE */
-
-    /* USER CODE BEGIN 3 */
-	  /* --- dt since last tick, exact from DWT (wrap-safe unsigned sub) --- */
-	  uint32_t now_cyc = DWT->CYCCNT;
-	      float dt = (float)(now_cyc - last_cyc) / (float)SystemCoreClock;
-	      last_cyc = now_cyc;
-
-	      int32_t gain_pct = 100;
-
-
-	      //set gain according to current gain setting
-	      if (current_mode == MODE_PRECISION){
-	    	  gain_pct = 100;
-	    	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_RESET);
-	      }
-	      else if (current_mode == MODE_FAST){
-	    	  gain_pct = 300;
-	    	  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_7, GPIO_PIN_SET);
-	      }
-
-	      //set mode(tool) LED according to current
-	      if (current_tool == TOOL_CATHETER){
-	    	  HAL_GPIO_WritePin(GPIOA,GPIO_PIN_6,GPIO_PIN_SET);
-	      }
-	      else if (current_tool == TOOL_GUIDE){
-	    	  HAL_GPIO_WritePin(GPIOA,GPIO_PIN_6,GPIO_PIN_RESET);
-	      }
-
-
-
-
-	      int32_t d[4];
-	      for (int i = 0; i < 4; i++) {
-	          d[i] = in_enc_delta(&in_enc[i]);
-	      }
-
-	      int32_t routed[N_MOT] = {0};
-	      routed[0] = d[0];                               /* M1<-enc1 */
-	      routed[1] = d[1];                               /* M2<-enc2 */
-	      routed[2] = d[2];                               /* M3<-enc3 */
-	      if (enc4_sel == SEL_M4) routed[3] = d[3];       /* M4<-enc4, M5 holds */
-	      else                    routed[4] = d[3];       /* M5<-enc4, M4 holds */
-
-	      for (int m = 0; m < N_MOT; m++) {
-	    	  int32_t g = mot[m].gain_enabled ? gain_pct : 100;
-	    	  int64_t one_step = (int64_t)100 * RATIO_DEN * mot[m].gear_den;
-	      	  mot[m].accum_num += (int64_t)routed[m] * g * RATIO_NUM * mot[m].gear_num * mot[m].dir_sign;
-	      	  while (mot[m].accum_num >=  one_step) { mot[m].accum_num -= one_step; mot[m].target_pos++; }
-	      	  while (mot[m].accum_num <= -one_step) { mot[m].accum_num += one_step; mot[m].target_pos--; }
-	      	  control_tick(&mot[m], dt);
-	      }
-
-	      /* main.c — inside while(1), diagnosis only, remove afterwards.
-	       * Each read blocks ~1-2 ms with IRQs off + printf blocks: motors WILL stutter every 2 s. */
-	      /*
-	      static uint32_t last_diag = 0;
-	      if (HAL_GetTick() - last_diag >= 2000) {
-	          last_diag = HAL_GetTick();
-	          uint32_t gstat = 0, gconf = 0, ifcnt = 0;
-	          TMC_Status_t r1 = tmc_diag_read(GPIOB, GPIO_PIN_1, 0, 0x01, &gstat);
-	          TMC_Status_t r2 = tmc_diag_read(GPIOB, GPIO_PIN_1, 0, 0x00, &gconf);
-	          TMC_Status_t r3 = tmc_diag_read(GPIOB, GPIO_PIN_1, 0, 0x02, &ifcnt);
-	          printf("[M5] GSTAT: code=%d val=0x%02lX | GCONF: code=%d val=0x%08lX | IFCNT: code=%d val=%lu\r\n",
-	                 (int)r1, (unsigned long)gstat,
-	                 (int)r2, (unsigned long)gconf,
-	                 (int)r3, (unsigned long)(ifcnt & 0xFFu));
-	      }
-	      */
-
-	      //delay_us(1000);
-	      //HAL_Delay(1);
-  }
-  /* USER CODE END 3 */
-}
-
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
-void SystemClock_Config(void)
-{
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
-
-  /** Configure the main internal regulator output voltage
-  */
-  __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE3);
-
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 336;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
-  RCC_OscInitStruct.PLL.PLLQ = 2;
-  RCC_OscInitStruct.PLL.PLLR = 2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-  {
-    Error_Handler();
-  }
-
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
-
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-}
-
-/**
-  * @brief TIM1 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM1_Init(void)
-{
-
-  /* USER CODE BEGIN TIM1_Init 0 */
-
-  /* USER CODE END TIM1_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM1_Init 1 */
-
-  /* USER CODE END TIM1_Init 1 */
-  htim1.Instance = TIM1;
-  htim1.Init.Prescaler = 0;
-  htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim1.Init.Period = 65535;
-  htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim1.Init.RepetitionCounter = 0;
-  htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim1, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM1_Init 2 */
-
-  /* USER CODE END TIM1_Init 2 */
-
-}
-
-/**
-  * @brief TIM2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM2_Init(void)
-{
-
-  /* USER CODE BEGIN TIM2_Init 0 */
-
-  /* USER CODE END TIM2_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM2_Init 1 */
-
-  /* USER CODE END TIM2_Init 1 */
-  htim2.Instance = TIM2;
-  htim2.Init.Prescaler = 0;
-  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 4294967295;
-  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim2, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM2_Init 2 */
-
-  /* USER CODE END TIM2_Init 2 */
-
-}
-
-/**
-  * @brief TIM3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM3_Init(void)
-{
-
-  /* USER CODE BEGIN TIM3_Init 0 */
-
-  /* USER CODE END TIM3_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM3_Init 1 */
-
-  /* USER CODE END TIM3_Init 1 */
-  htim3.Instance = TIM3;
-  htim3.Init.Prescaler = 0;
-  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim3.Init.Period = 65535;
-  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim3.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim3, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM3_Init 2 */
-
-  /* USER CODE END TIM3_Init 2 */
-
-}
-
-/**
-  * @brief TIM4 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM4_Init(void)
-{
-
-  /* USER CODE BEGIN TIM4_Init 0 */
-
-  /* USER CODE END TIM4_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM4_Init 1 */
-
-  /* USER CODE END TIM4_Init 1 */
-  htim4.Instance = TIM4;
-  htim4.Init.Prescaler = 0;
-  htim4.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim4.Init.Period = 65535;
-  htim4.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim4.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim4, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim4, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM4_Init 2 */
-
-  /* USER CODE END TIM4_Init 2 */
-
-}
-
-/**
-  * @brief TIM5 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM5_Init(void)
-{
-
-  /* USER CODE BEGIN TIM5_Init 0 */
-
-  /* USER CODE END TIM5_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM5_Init 1 */
-
-  /* USER CODE END TIM5_Init 1 */
-  htim5.Instance = TIM5;
-  htim5.Init.Prescaler = 0;
-  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim5.Init.Period = 4294967295;
-  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim5, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM5_Init 2 */
-
-  /* USER CODE END TIM5_Init 2 */
-
-}
-
-/**
-  * @brief TIM8 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_TIM8_Init(void)
-{
-
-  /* USER CODE BEGIN TIM8_Init 0 */
-
-  /* USER CODE END TIM8_Init 0 */
-
-  TIM_Encoder_InitTypeDef sConfig = {0};
-  TIM_MasterConfigTypeDef sMasterConfig = {0};
-
-  /* USER CODE BEGIN TIM8_Init 1 */
-
-  /* USER CODE END TIM8_Init 1 */
-  htim8.Instance = TIM8;
-  htim8.Init.Prescaler = 0;
-  htim8.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim8.Init.Period = 65535;
-  htim8.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
-  htim8.Init.RepetitionCounter = 0;
-  htim8.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
-  sConfig.EncoderMode = TIM_ENCODERMODE_TI12;
-  sConfig.IC1Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC1Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC1Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC1Filter = 0;
-  sConfig.IC2Polarity = TIM_ICPOLARITY_RISING;
-  sConfig.IC2Selection = TIM_ICSELECTION_DIRECTTI;
-  sConfig.IC2Prescaler = TIM_ICPSC_DIV1;
-  sConfig.IC2Filter = 0;
-  if (HAL_TIM_Encoder_Init(&htim8, &sConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-  if (HAL_TIMEx_MasterConfigSynchronization(&htim8, &sMasterConfig) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN TIM8_Init 2 */
-
-  /* USER CODE END TIM8_Init 2 */
-
-}
-
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART2_UART_Init(void)
-{
-
-  /* USER CODE BEGIN USART2_Init 0 */
-
-  /* USER CODE END USART2_Init 0 */
-
-  /* USER CODE BEGIN USART2_Init 1 */
-
-  /* USER CODE END USART2_Init 1 */
-  huart2.Instance = USART2;
-  huart2.Init.BaudRate = 115200;
-  huart2.Init.WordLength = UART_WORDLENGTH_8B;
-  huart2.Init.StopBits = UART_STOPBITS_1;
-  huart2.Init.Parity = UART_PARITY_NONE;
-  huart2.Init.Mode = UART_MODE_TX_RX;
-  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
-  if (HAL_UART_Init(&huart2) != HAL_OK)
-  {
-    Error_Handler();
-  }
-  /* USER CODE BEGIN USART2_Init 2 */
-
-  /* USER CODE END USART2_Init 2 */
-
-}
-
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_GPIO_Init(void)
-{
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
-
-  /* USER CODE END MX_GPIO_Init_1 */
-
-  /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_0|GPIO_PIN_1
-                          |GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5
-                          |GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11
-                          |GPIO_PIN_12, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_11|GPIO_PIN_12, GPIO_PIN_RESET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0|GPIO_PIN_1, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_2, GPIO_PIN_RESET);
-
-  /*Configure GPIO pins : PC13 PC14 PC0 PC1
-                           PC2 PC3 PC4 PC5
-                           PC8 PC9 PC10 PC11
-                           PC12 */
-  GPIO_InitStruct.Pin = GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_0|GPIO_PIN_1
-                          |GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5
-                          |GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11
-                          |GPIO_PIN_12;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PC15 */
-  GPIO_InitStruct.Pin = GPIO_PIN_15;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PA4 PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_4|GPIO_PIN_5;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PA6 PA7 PA11 PA12 */
-  GPIO_InitStruct.Pin = GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_11|GPIO_PIN_12;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-
-  /*Configure GPIO pins : PB0 PB1 */
-  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_OD;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PB2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PD2 */
-  GPIO_InitStruct.Pin = GPIO_PIN_2;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
-
-  /* EXTI interrupt init*/
-  HAL_NVIC_SetPriority(EXTI4_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
-
-  HAL_NVIC_SetPriority(EXTI9_5_IRQn, 0, 0);
-  HAL_NVIC_EnableIRQ(EXTI9_5_IRQn);
-
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
-
-  /* USER CODE END MX_GPIO_Init_2 */
-}
-
-/* USER CODE BEGIN 4 */
-
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
-{
-    if (GPIO_Pin == GPIO_PIN_5) { 								//gain button ISR
-        static uint32_t last = 0;
-        uint32_t now = DWT->CYCCNT;
-
-        /* 200 ms window @ 84 MHz = 84000 cycles/ms * 200 */
-        if ((uint32_t)(now - last) >= (84000UL * 200UL)) {
-            last = now;
-  	      if (HAL_GPIO_ReadPin(GPIOA,GPIO_PIN_5) == 1){
-  	    	  if (current_mode == MODE_PRECISION){
-  	    		  current_mode = MODE_FAST;
-  	    	  }
-  	    	  else if (current_mode == MODE_FAST){
-  	    	  	  current_mode = MODE_PRECISION;
-  	    	  }
-  	      }
-
-
+    for (int i = 0; i < 2; i++) {
+        const HomeAxis *a = &home_ax[i];
+        Motor *m = &mot[a->mi];
+        uint16_t current = touch_mode ?
+                           a->touch_current_ma : HOME_NORMAL_CURRENT_MA;
+        if (TMC2209uart(current, MICROSTEP, m->pdn_port,
+                        m->pdn_pin, m->tmc_addr) != TMC_OK) {
+            printf("[HOME] M%d current setup failed\r\n", a->mi + 1);
+            return HOME_DRIVER_FAULT;
         }
     }
-
-
-    if (GPIO_Pin == GPIO_PIN_4) {								//mode button ISR
-            static uint32_t last = 0;
-            uint32_t now = DWT->CYCCNT;
-
-            /* 200 ms window @ 84 MHz = 84000 cycles/ms * 200 */
-            if ((uint32_t)(now - last) >= (84000UL * 200UL)) {
-                last = now;
-      	      if (HAL_GPIO_ReadPin(GPIOA,GPIO_PIN_4) == 1){
-      	    	  if (current_tool == TOOL_CATHETER){
-      	    		  current_tool = TOOL_GUIDE;
-      	    		  enc4_sel = SEL_M5;
-      	    	  }
-      	    	  else if (current_tool == TOOL_GUIDE){
-      	    	  	  current_tool = TOOL_CATHETER;
-      	    	  	  enc4_sel = SEL_M4;
-      	    	  }
-      	      }
-
-
-            }
-        }
+    return HOME_OK;
 }
 
-
-/* USER CODE END 4 */
-
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
-void Error_Handler(void)
+static HomeStatus home_seek_pair(const int8_t seek_dir[2],
+                                 const uint8_t allow_already[2],
+                                 const int32_t min_arm_counts[2],
+                                 HomeStop result[2])
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
-  __disable_irq();
-  while (1)
-  {
-  }
-  /* USER CODE END Error_Handler_Debug */
-}
-#ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
-void assert_failed(uint8_t *file, uint32_t line)
-{
-  /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
-}
-#endif /* USE_FULL_ASSERT */
+    HomeSeekState s[2] = {0};
+    const uint32_t step_cyc = SystemCoreClock / HOME_APPROACH_V;
+    uint8_t completed = 0;
+
+    for (int i = 0; i < 2; i++) {
+        home_set_direction(&home_ax[i], seek_dir[i]);
+        s[i].prev =
