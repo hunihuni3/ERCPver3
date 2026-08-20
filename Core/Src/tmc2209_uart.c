@@ -21,20 +21,9 @@
  *   No hardware timer/UART peripheral is used. Interrupts are disabled only
  *   during the receive sampling window to keep bit alignment.
  *
- * --- DEBUG OUTPUT ------------------------------------------------------------
- *   printf() goes to USART2. This requires you to have retargeted printf, e.g.
- *   in main.c or syscalls.c:
- *
- *       extern UART_HandleTypeDef huart2;
- *       int __io_putchar(int ch) {
- *           HAL_UART_Transmit(&huart2, (uint8_t*)&ch, 1, HAL_MAX_DELAY);
- *           return ch;
- *       }
- *   (and add  #include <stdio.h>  + set "Use float with printf" off to save flash)
  * ===========================================================================*/
 
 #include "tmc2209_uart.h"
-#include <stdio.h>
 
 /* ----------------------------- CONFIG --------------------------------------*/
 
@@ -310,22 +299,15 @@ TMC_Status_t TMC2209uart(uint16_t current_in_ma,
                          uint16_t comm_pin,
                          uint8_t slave_addr)
 {
-    printf("\r\n[TMC2209] --- config start (addr=%u) ---\r\n", slave_addr);
-
     /* --- validate microstepping early --- */
     uint8_t mres = microsteps_to_mres(microstepping);
     if (mres == 0xFFu) {
-        printf("[TMC2209] ERROR: invalid microstepping %u (use 0/1/2/4/8/16/32/64/128/256)\r\n",
-               microstepping);
         return TMC_ERR_WRITE_FAILED;
     }
 
     /* --- one-time timing setup --- */
     dwt_init();
     g_cycles_per_bit = SystemCoreClock / TMC2209_BAUD;
-    printf("[TMC2209] SysClk=%lu Hz, baud=%u, %lu cycles/bit\r\n",
-           (unsigned long)SystemCoreClock, (unsigned)TMC2209_BAUD,
-           (unsigned long)g_cycles_per_bit);
 
     /* idle = line released (high) */
     line_release(comm_port, comm_pin);
@@ -335,20 +317,15 @@ TMC_Status_t TMC2209uart(uint16_t current_in_ma,
     TMC_Status_t rs = tmc_read_reg(comm_port, comm_pin, slave_addr,
                                    TMC_REG_GCONF, &gconf);
     if (rs != TMC_OK) {
-        printf("[TMC2209] ERROR: no valid reply to GCONF read (code=%d). "
-               "Check pin, pull-up, VIO, address.\r\n", (int)rs);
         return rs;
     }
-    printf("[TMC2209] link OK. GCONF=0x%08lX\r\n", (unsigned long)gconf);
 
 
     /* baseline IFCNT before our writes */
     uint32_t ifcnt_before = tmc_read_ifcnt(comm_port, comm_pin, slave_addr);
     if (ifcnt_before == 0xFFFFFFFFu) {
-        printf("[TMC2209] ERROR: IFCNT read failed\r\n");
         return TMC_ERR_NO_REPLY;
     }
-    printf("[TMC2209] IFCNT before = %lu\r\n", (unsigned long)ifcnt_before);
 
     /* GCONF fixups — must precede IHOLD_IRUN and CHOPCONF writes.
          * Reset default 0x101 = I_scale_analog | multistep_filt.
@@ -358,8 +335,6 @@ TMC_Status_t TMC2209uart(uint16_t current_in_ma,
         gconf_new |=  (1u << 6);     /* pdn_disable      = 1: PDN_UART is the UART line */
         gconf_new |=  (1u << 7);     /* mstep_reg_select = 1: MRES from CHOPCONF, not MS1/MS2 */
         gconf_new |=  (1u << 2);     /* en_spreadcycle = 1: no StealthChop AT dependency */
-        printf("[TMC2209] GCONF 0x%08lX -> 0x%08lX\r\n",
-                   (unsigned long)gconf, (unsigned long)gconf_new);
         tmc_write_reg(comm_port, comm_pin, slave_addr, TMC_REG_GCONF, gconf_new);
 
 
@@ -372,8 +347,6 @@ TMC_Status_t TMC2209uart(uint16_t current_in_ma,
                           ((uint32_t)(irun  & 0x1F) << 8) |
                           ((uint32_t)(iholddelay & 0x0F) << 16);
 
-    printf("[TMC2209] target %u mA -> IRUN(CS)=%u, IHOLD=%u\r\n",
-           current_in_ma, irun, ihold);
     tmc_write_reg(comm_port, comm_pin, slave_addr,
                   TMC_REG_IHOLD_IRUN, ihold_irun);
 
@@ -382,7 +355,6 @@ TMC_Status_t TMC2209uart(uint16_t current_in_ma,
     rs = tmc_read_reg(comm_port, comm_pin, slave_addr,
                       TMC_REG_CHOPCONF, &chopconf);
     if (rs != TMC_OK) {
-        printf("[TMC2209] ERROR: CHOPCONF read failed (code=%d)\r\n", (int)rs);
         return rs;
     }
     /* If CHOPCONF is fully zero the chip likely has no usable TOFF; set a
@@ -391,46 +363,26 @@ TMC_Status_t TMC2209uart(uint16_t current_in_ma,
         /* TOFF=3, HSTRT=4(-1 enc=4), HEND=0, TBL=2 (0x10000 area) — minimal
          * working SpreadCycle. Adjust to taste. */
         chopconf = (3u << 0) | (5u << 4) | (0u << 7) | (2u << 15);
-        printf("[TMC2209] CHOPCONF was 0, applying default chopper bits\r\n");
     }
     chopconf &= ~(0x0Fu << 24);                 /* clear MRES field [27:24] */
     chopconf |=  ((uint32_t)mres << 24);        /* set new MRES             */
     /* ensure VSENSE=0 (high-current/full VFS) bit 17 — matches our calc */
     chopconf &= ~(1u << 17);
 
-    printf("[TMC2209] microstep %u -> MRES=%u, CHOPCONF=0x%08lX\r\n",
-           microstepping, mres, (unsigned long)chopconf);
     tmc_write_reg(comm_port, comm_pin, slave_addr,
                   TMC_REG_CHOPCONF, chopconf);
 
     /* --- verify both writes via IFCNT (should have +2) --- */
     uint32_t ifcnt_after = tmc_read_ifcnt(comm_port, comm_pin, slave_addr);
     if (ifcnt_after == 0xFFFFFFFFu) {
-        printf("[TMC2209] ERROR: IFCNT readback failed\r\n");
         return TMC_ERR_NO_REPLY;
     }
     uint8_t delta = (uint8_t)(ifcnt_after - ifcnt_before); /* 8-bit wrap-safe */
-    printf("[TMC2209] IFCNT after = %lu (delta=%u, expected 3)\r\n",
-           (unsigned long)ifcnt_after, delta);
 
     if (delta < 3) {
-        printf("[TMC2209] ERROR: writes not all accepted (delta=%u)\r\n", delta);
         return TMC_ERR_WRITE_FAILED;
     }
 
-    /* --- optional content verify: read CHOPCONF back, check MRES --- */
-    uint32_t chk = 0;
-    if (tmc_read_reg(comm_port, comm_pin, slave_addr,
-                     TMC_REG_CHOPCONF, &chk) == TMC_OK) {
-        uint8_t mres_rb = (uint8_t)((chk >> 24) & 0x0F);
-        if (mres_rb == mres) {
-            printf("[TMC2209] verify OK: MRES readback=%u matches\r\n", mres_rb);
-        } else {
-            printf("[TMC2209] WARN: MRES readback=%u != %u\r\n", mres_rb, mres);
-        }
-    }
-
-    printf("[TMC2209] --- config done OK ---\r\n");
     return TMC_OK;
 }
 

@@ -57,6 +57,12 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define M45_RATIO_POT_Pin GPIO_PIN_7
+#define M45_RATIO_POT_GPIO_Port GPIOA
+#define GAIN_LED_Pin GPIO_PIN_12
+#define GAIN_LED_GPIO_Port GPIOB
+#define M1_ENDSTOP_Pin GPIO_PIN_14
+#define M1_ENDSTOP_GPIO_Port GPIOB
 #define TMS_Pin GPIO_PIN_13
 #define TMS_GPIO_Port GPIOA
 #define TCK_Pin GPIO_PIN_14
