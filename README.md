@@ -1,4 +1,4 @@
-# ERCPver3 Motor Control Firmware
+# ERCP Control Firmware (코드설명은 docs의 md 참고)
 
 STM32F446RE와 TMC2209 드라이버를 사용하는 5축 모터 제어 펌웨어다.
 
