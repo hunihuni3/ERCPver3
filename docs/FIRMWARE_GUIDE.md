@@ -96,7 +96,9 @@ INPUT_ENCODER_COUNTS_PER_REV
 - `TMC_INIT_RETRIES=3`: 최초 시도를 포함한 TMC2209 초기화 총 시도 횟수다.
 - `TMC_INIT_RETRY_DELAY_MS=100`: 실패 후 다음 시도까지 기다리는 시간이다.
 - `BUTTON_DEBOUNCE_MS=200`: 같은 버튼에서 200 ms 이내에 다시 발생한 인터럽트를 무시한다.
-- `SWV_REPORT_PERIOD_MS=200`: SWV 상태를 초당 5회 출력한다. 너무 줄이면 제어 루프에 부담을 줄 수 있다.
+- `UART_BAUD_RATE=115200`: USART2 디버그 출력 속도다.
+- `UART_TX_TIMEOUT_MS=30`: blocking UART 송신의 최대 대기 시간이다.
+- 수동 운전 중 주기 텔레메트리는 출력하지 않는다. M1/M2 limit 또는 M3 물리 endstop이 처음 활성화될 때만 이벤트를 출력한다.
 
 ## Manual-control values shared by all axes
 
@@ -282,7 +284,7 @@ static void MX_TIM1_Init(void);
 - 사용자가 직접 만든 함수의 원형을 둘 수 있는 보호 구간이다.
 - 현재는 비어 있다. 이어지는 `USER CODE BEGIN 0`에서 필요한 사용자 함수를 사용 전에 정의하고 있기 때문이다.
 
-이 선언부 다음의 `/* Private user code */`와 `USER CODE BEGIN 0`부터 모드, SWV 출력, 엔코더 계산, 모터 제어처럼 프로젝트 고유의 코드가 시작된다.
+이 선언부 다음의 `/* Private user code */`와 `USER CODE BEGIN 0`부터 모드, UART 출력, 엔코더 계산, 모터 제어처럼 프로젝트 고유의 코드가 시작된다.
 
 # 2. `USER CODE 0` 시작: 모드와 공통 보조 함수
 
@@ -299,18 +301,19 @@ MODE_FAST      -> M4/M5 gain 300%
 
 `current_mode`는 PA5 버튼 ISR에서 쓰고 메인 루프에서 읽으므로 `volatile`이다. 초기 상태는 Precision이다. M1~M3에는 영향을 주지 않는다.
 
-## `swv_printf()`
+## `uart_printf()`
 
-`vsnprintf()`로 최대 192바이트 문자열을 만든 뒤 각 문자를 `ITM_SendChar()`로 보낸다.
+`vsnprintf()`로 최대 192바이트 문자열을 만든 뒤 USART2로 전송한다.
 
 ```text
 format + arguments
 -> 192-byte buffer
--> ITM Stimulus Port 0
--> STM32CubeIDE SWV ITM Data Console
+-> HAL_UART_Transmit()
+-> USART2 PA2/PA3
+-> ST-LINK Virtual COM Port
 ```
 
-192바이트를 넘는 결과는 잘린다. UART 함수가 아니며, 긴 문자열을 자주 출력하면 루프 시간에 영향을 줄 수 있다.
+192바이트를 넘는 결과는 잘린다. 현재 송신은 blocking 방식이므로 긴 문자열을 자주 출력하면 루프 시간에 영향을 줄 수 있다.
 
 ## DWT와 STEP pulse
 
@@ -418,7 +421,7 @@ SEL_M4_M5_COUPLED -> M4/M5 연속 속도제어
 
 `enc4_sel`은 PA4 버튼 ISR에서 변경되고 메인 루프에서 읽으므로 `volatile`이다. 초기값은 M4다.
 
-`enc4_mode_name()`은 상태를 SWV 문자열로 바꾸고 알 수 없는 값에는 `UNKNOWN`을 반환한다.
+`enc4_mode_name()`은 상태를 UART 로그 문자열로 바꾸고 알 수 없는 값에는 `UNKNOWN`을 반환한다.
 
 ## 가변저항 상태
 
@@ -562,7 +565,7 @@ M1은 TIM5 32비트와 `esign=+1`, M2는 TIM8 16비트와 `esign=-1`을 사용�
 | `HOME_DRIVER_FAULT` | TMC 준비 또는 전류 설정 실패 |
 | `HOME_SWITCH_NOT_RELEASED` | M3 후퇴 후 스위치 미해제 |
 
-`home_status_name()`은 SWV 출력용 문자열로 변환한다.
+`home_status_name()`은 UART 출력용 문자열로 변환한다.
 
 ## 임시 및 영구 상태 구조체
 
@@ -593,15 +596,15 @@ HomeAxis의 16/32비트 설정에 맞게 feedback count 차이를 계산하고 w
 
 1. TIM5/TIM8 현재 위치 계산
 2. hysteresis를 적용해 MIN/MAX 상태 갱신
-3. 상태 변경을 SWV로 출력
-4. 바깥 방향 새 입력을 0으로 변경
-5. 남아 있는 목표 또는 속도가 바깥 방향이면 `stop_motor_motion()` 호출
+3. 바깥 방향 새 입력을 0으로 변경
+4. 남아 있는 목표 또는 속도가 바깥 방향이면 `stop_motor_motion()` 호출
+5. MIN/MAX가 새로 활성화된 경우에만 UART 이벤트를 한 번 출력
 
 최소 한계에서는 더 작은 논리 위치로 가는 입력만 차단하고 반대 방향 복귀는 허용한다. 최대 한계도 같은 원리다.
 
-### `swv_report_manual()`
+### 수동 limit 이벤트 UART
 
-M1/M2 feedback 위치와 범위, M3 명령 위치, M4/M5 위치와 모드, 가변저항 비율을 출력한다. M3 값은 실제 feedback 위치가 아니다.
+주기 상태 출력 함수는 사용하지 않는다. `apply_m12_limit()`은 M1/M2의 MIN/MAX가 비활성에서 활성으로 바뀔 때만 이벤트를 출력하고, `m3_manual_tick()`은 M3 물리 endstop이 새로 활성화될 때만 이벤트를 출력한다. 해제 이벤트와 정상 수동 운전 상태는 출력하지 않는다.
 
 ### `home_set_direction()`
 
@@ -787,10 +790,9 @@ dt 계산
 -> m12_manual_tick(M2)
 -> m3_manual_tick()
 -> m45_manual_tick()
--> SWV 주기 출력
 ```
 
-`dt`는 DWT cycle 차이를 `SystemCoreClock`으로 나눈 값이다. 제어 주기는 고정되어 있지 않고 STEP과 SWV 처리량에 따라 달라진다.
+`dt`는 DWT cycle 차이를 `SystemCoreClock`으로 나눈 값이다. 제어 주기는 고정되어 있지 않고 STEP 처리량에 따라 달라진다. 수동 상태의 주기 UART 출력은 제거되어 있다.
 
 ### Encoder 4 모드 변경 처리
 
@@ -875,7 +877,7 @@ MODE_PRECISION <-> MODE_FAST
 SEL_M4 -> SEL_M5 -> SEL_M4_M5_COUPLED -> SEL_M4
 ```
 
-ISR에서는 상태만 변경한다. 모터 상태 초기화와 LED 갱신은 메인 루프가 한다. ISR 안에서 SWV 또는 향후 UART 문자열을 직접 보내지 않아야 한다.
+ISR에서는 상태만 변경한다. 모터 상태 초기화와 LED 갱신은 메인 루프가 한다. ISR 안에서 UART 문자열을 직접 보내지 않아야 한다.
 
 ## `Error_Handler()`
 
@@ -887,33 +889,33 @@ HAL 초기화 도중 직접 호출되는 다른 오류 경로에서는 호출 �
 
 `USE_FULL_ASSERT`가 활성화됐을 때만 포함된다. 현재는 `file`과 `line`을 사용하지 않는다.
 
-# 13. 디버깅과 향후 UART
+# 13. UART 디버깅
 
-현재 디버깅은 SWV ITM Data Console을 사용한다.
+현재 디버깅은 USART2와 ST-LINK Virtual COM Port를 사용한다.
 
 ```text
-Core Clock: 84 MHz
-Stimulus Port: 0
+USART2: PA2 TX, PA3 RX
+Baud rate: 115200
+Data format: 8-N-1
+Flow control: None
 ```
 
-UART는 아직 `main.c`에 추가하지 않았다. 향후 다음 원칙을 적용한다.
+현재 `uart_printf()`는 `HAL_UART_Transmit()` 기반 blocking 송신이다. 다음 원칙을 적용한다.
 
 - ISR과 모션 루프에서 긴 blocking 송신 금지
-- 이벤트 로그와 주기 텔레메트리 분리
-- 100~200 ms 주기로 시작
+- 수동 운전 중 주기 텔레메트리 출력 금지
+- M1/M2 limit 및 M3 물리 endstop 활성 이벤트만 1회 출력
+- limit 이벤트는 모션을 먼저 정지한 뒤 출력
 - 가능하면 DMA 또는 interrupt 기반 queue 사용
-- M1/M2는 feedback, target, current, error, velocity, limit을 구분
-- M3 `current_pos`는 실제 feedback이 아니라 STEP 명령 위치라고 표시
 
 # 14. 남은 작업
 
 1. M1/M2 호밍 후 최종 정지 위치 확정
 2. M3 엔드스톱 눌림 높이를 기준으로 하한 좌표 결정
 3. M3 상한 결정
-4. M3 수동 운전 중 엔드스톱 방향 차단
-5. M3 속도와 가속도 조정
-6. 빠른 조작 시 목표 위치 누적량 측정
-7. UART 텔레메트리 구조 결정
+4. M3 속도와 가속도 조정
+5. 빠른 조작 시 목표 위치 누적량 측정
+6. 필요 시 UART 이벤트 출력을 interrupt 또는 DMA 기반 queue로 변경
 
 ## 실제 장비 조정 주의사항
 

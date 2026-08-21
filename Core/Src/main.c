@@ -65,7 +65,8 @@
 #define TMC_INIT_RETRIES                            3u
 #define TMC_INIT_RETRY_DELAY_MS                   100u
 #define BUTTON_DEBOUNCE_MS                         200u
-#define SWV_REPORT_PERIOD_MS                       200u
+#define UART_BAUD_RATE                          115200u
+#define UART_TX_TIMEOUT_MS                          30u
 
 /* ===== Manual-control values shared by all axes ========================== */
 #define MANUAL_FIXED_GAIN_PCT                       100
@@ -149,6 +150,8 @@
 /* Private variables ---------------------------------------------------------*/
 ADC_HandleTypeDef hadc1;
 
+UART_HandleTypeDef huart2;
+
 TIM_HandleTypeDef htim1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
@@ -170,6 +173,7 @@ static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM5_Init(void);
 static void MX_TIM8_Init(void);
+static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -187,7 +191,7 @@ typedef enum {
 static volatile Mode current_mode = MODE_PRECISION;
 
 
-static void swv_printf(const char *format, ...)
+static void uart_printf(const char *format, ...)
 {
     char buffer[192];
     va_list args;
@@ -200,8 +204,8 @@ static void swv_printf(const char *format, ...)
     if (length >= (int)sizeof(buffer))
         length = (int)sizeof(buffer) - 1;
 
-    for (int i = 0; i < length; i++)
-        ITM_SendChar((uint32_t)buffer[i]);
+    (void)HAL_UART_Transmit(&huart2, (uint8_t *)buffer,
+                           (uint16_t)length, UART_TX_TIMEOUT_MS);
 }
 
 
@@ -602,6 +606,7 @@ typedef struct {
 } ManualLimit;
 
 static ManualLimit m12_limit[2] = {0};
+static uint8_t m3_manual_endstop_latched = 0u;
 
 static HomeStatus m3_home_begin(void);
 static HomeStatus m3_home_service(void);
@@ -665,14 +670,8 @@ static void apply_m12_limit(uint8_t axis, int32_t *input)
     else
         limit->max_active = limit->position >= limit->max_count;
 
-    if (old_min != limit->min_active)
-        swv_printf("M%u MIN LIMIT %s pos=%ld\r\n", axis + 1u,
-                   limit->min_active ? "ON" : "OFF",
-                   (long)limit->position);
-    if (old_max != limit->max_active)
-        swv_printf("M%u MAX LIMIT %s pos=%ld\r\n", axis + 1u,
-                   limit->max_active ? "ON" : "OFF",
-                   (long)limit->position);
+    uint8_t min_activated = !old_min && limit->min_active;
+    uint8_t max_activated = !old_max && limit->max_active;
 
     uint8_t block_input =
         (limit->min_active && *input < 0) ||
@@ -693,30 +692,14 @@ static void apply_m12_limit(uint8_t axis, int32_t *input)
 
     if (moving_outward)
         stop_motor_motion(m);
-}
 
-static void swv_report_manual(void)
-{
-    for (uint8_t i = 0; i < 2; i++) {
-        ManualLimit *limit = &m12_limit[i];
-        swv_printf("M%u pos=%ld safe=[%ld,%ld] hard=[%ld,%ld] limit=%s\r\n",
-                   i + 1u,
-                   (long)limit->position,
-                   (long)limit->min_count,
-                   (long)limit->max_count,
-                   (long)limit->hard_min_count,
-                   (long)limit->hard_max_count,
-                   limit->min_active ? "MIN" :
-                   (limit->max_active ? "MAX" : "NONE"));
-    }
-
-    swv_printf("M3 command=%ld target=%ld\r\n",
-               (long)mot[2].current_pos, (long)mot[2].target_pos);
-    swv_printf("M4=%ld M5=%ld mode=%s ratio=%ld/1000\r\n",
-               (long)mot[3].current_pos,
-               (long)mot[4].current_pos,
-               enc4_mode_name(enc4_sel),
-               (long)coupled_m5_ratio_x1000);
+    /* Report only a newly reached manual limit, after motion is stopped. */
+    if (min_activated)
+        uart_printf("M%u MIN LIMIT pos=%ld\r\n", axis + 1u,
+                    (long)limit->position);
+    if (max_activated)
+        uart_printf("M%u MAX LIMIT pos=%ld\r\n", axis + 1u,
+                    (long)limit->position);
 }
 
 static void home_set_direction(const HomeAxis *a, int8_t logical_dir)
@@ -1238,6 +1221,31 @@ static void m12_manual_tick(uint8_t axis, int32_t input, float dt)
 
 static void m3_manual_tick(int32_t input, float dt)
 {
+    Motor *m = &mot[MOTOR_M3_INDEX];
+    uint8_t endstop_active = m3_endstop_active();
+
+    if (endstop_active) {
+        uint8_t moving_toward_endstop =
+            input < 0 ||
+            m->target_pos < m->current_pos ||
+            m->vel < 0.0f;
+
+        if (input < 0) {
+            input = 0;
+            m->accum_num = 0;
+        }
+        if (moving_toward_endstop)
+            stop_motor_motion(m);
+
+        if (!m3_manual_endstop_latched) {
+            m3_manual_endstop_latched = 1u;
+            uart_printf("M3 MIN ENDSTOP pos=%ld\r\n",
+                        (long)m->current_pos);
+        }
+    } else {
+        m3_manual_endstop_latched = 0u;
+    }
+
     manual_position_tick(MOTOR_M3_INDEX, input, MANUAL_FIXED_GAIN_PCT,
                          dt, M3_MANUAL_MAX_SPEED_SPS,
                          M3_MANUAL_ACCEL_SPS2);
@@ -1315,6 +1323,7 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM5_Init();
   MX_TIM8_Init();
+  MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
 
   /* Phase 1: keep every driver disabled while clocks and feedback start. */
@@ -1322,7 +1331,7 @@ int main(void)
     HAL_GPIO_WritePin(mot[m].en_port, mot[m].en_pin, GPIO_PIN_SET);
 
   dwt_delay_init();
-  swv_printf("BOOT: M1 M2 M3 M4 M5 CONTROL\r\n");
+  uart_printf("BOOT: M1 M2 M3 M4 M5 CONTROL\r\n");
   HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
   HAL_TIM_Encoder_Start(&htim8, TIM_CHANNEL_ALL);
 
@@ -1334,33 +1343,33 @@ int main(void)
   HAL_Delay(10u);
   for (int m = 0; m < HOMING_MOTOR_COUNT; m++) {
     uint8_t ready = motor_driver_init((uint8_t)m);
-    swv_printf("M%d DRIVER %s\r\n", m + 1,
+    uart_printf("M%d DRIVER %s\r\n", m + 1,
                ready ? "OK" : "ERROR");
   }
 
   /* Phase 3: home M1/M2/M3. Any failure inhibits all motion. */
-  swv_printf("M1 M2 M3 HOMING START\r\n");
+  uart_printf("M1 M2 M3 HOMING START\r\n");
   HomeStatus home_status = home_m1_m2_m3();
 
   if (home_status != HOME_OK) {
-    swv_printf("HOME ERROR: %s (%u)\r\n",
+    uart_printf("HOME ERROR: %s (%u)\r\n",
                home_status_name(home_status), (unsigned)home_status);
     for (int m = 0; m < MOTOR_COUNT; m++)
       HAL_GPIO_WritePin(mot[m].en_port, mot[m].en_pin, GPIO_PIN_SET);
     Error_Handler();
   }
 
-  swv_printf("M1 HOME hard=[%ld,%ld] safe=[%ld,%ld]\r\n",
+  uart_printf("M1 HOME hard=[%ld,%ld] safe=[%ld,%ld]\r\n",
              (long)m12_limit[0].hard_min_count,
              (long)m12_limit[0].hard_max_count,
              (long)m12_limit[0].min_count,
              (long)m12_limit[0].max_count);
-  swv_printf("M2 HOME hard=[%ld,%ld] safe=[%ld,%ld]\r\n",
+  uart_printf("M2 HOME hard=[%ld,%ld] safe=[%ld,%ld]\r\n",
              (long)m12_limit[1].hard_min_count,
              (long)m12_limit[1].hard_max_count,
              (long)m12_limit[1].min_count,
              (long)m12_limit[1].max_count);
-  swv_printf("M3 HOME OK\r\n");
+  uart_printf("M3 HOME OK\r\n");
 
   /* Phase 4: initialize M4/M5 only after homing has succeeded. */
   for (int m = MOTOR_M4_INDEX; m < MOTOR_COUNT; m++)
@@ -1369,7 +1378,7 @@ int main(void)
   HAL_Delay(10u);
   for (int m = MOTOR_M4_INDEX; m < MOTOR_COUNT; m++) {
     uint8_t ready = motor_driver_init((uint8_t)m);
-    swv_printf("M%d DRIVER %s\r\n", m + 1,
+    uart_printf("M%d DRIVER %s\r\n", m + 1,
                ready ? "OK" : "ERROR");
   }
 
@@ -1389,11 +1398,10 @@ int main(void)
   coupled_m5_ratio_x1000 = pot_adc_to_ratio_x1000(initial_pot);
 
   resync_input_encoders();
-  swv_printf("CONTROL START: ENC1=M1 ENC2=M2 ENC3=M3 ENC4=%s\r\n",
+  uart_printf("CONTROL START: ENC1=M1 ENC2=M2 ENC3=M3 ENC4=%s\r\n",
              enc4_mode_name(enc4_sel));
 
   uint32_t last_cyc = DWT->CYCCNT;
-  uint32_t last_report_ms = HAL_GetTick();
   Enc4Sel motion_enc4_sel = enc4_sel;
    /* USER CODE END 2 */
 
@@ -1435,19 +1443,12 @@ int main(void)
       reset_m4_m5_motion_state();
       motion_enc4_sel = selected;
       delta[INPUT_ENCODER_M45_INDEX] = 0;
-      swv_printf("ENC4 MODE: %s\r\n", enc4_mode_name(selected));
     }
 
     m12_manual_tick(MOTOR_M1_INDEX, delta[INPUT_ENCODER_M1_INDEX], dt);
     m12_manual_tick(MOTOR_M2_INDEX, delta[INPUT_ENCODER_M2_INDEX], dt);
     m3_manual_tick(delta[INPUT_ENCODER_M3_INDEX], dt);
     m45_manual_tick(selected, delta[INPUT_ENCODER_M45_INDEX], gain_pct, dt);
-
-    uint32_t now_ms = HAL_GetTick();
-    if ((uint32_t)(now_ms - last_report_ms) >= SWV_REPORT_PERIOD_MS) {
-      last_report_ms = now_ms;
-      swv_report_manual();
-    }
   }
   /* USER CODE END 3 */
 }
@@ -1530,6 +1531,25 @@ static void MX_ADC1_Init(void)
   sConfig.Rank = 1;
   sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
   if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+    Error_Handler();
+}
+
+/**
+  * @brief USART2 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART2_UART_Init(void)
+{
+  huart2.Instance = USART2;
+  huart2.Init.BaudRate = UART_BAUD_RATE;
+  huart2.Init.WordLength = UART_WORDLENGTH_8B;
+  huart2.Init.StopBits = UART_STOPBITS_1;
+  huart2.Init.Parity = UART_PARITY_NONE;
+  huart2.Init.Mode = UART_MODE_TX_RX;
+  huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart2) != HAL_OK)
     Error_Handler();
 }
 

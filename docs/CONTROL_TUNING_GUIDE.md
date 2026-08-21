@@ -31,14 +31,13 @@
 | M4/M5 단독 최고 속도·가속도 | `M45_MANUAL_MAX_SPEED_SPS`, `M45_MANUAL_ACCEL_SPS2` | 파라미터 |
 | M1/M2 수동 안전 여유 | `M1_LIMIT_MARGIN_COUNTS`, `M2_LIMIT_MARGIN_COUNTS` | 안전 파라미터 |
 | M3 수동 상한·하한 | 현재 미구현, `m3_manual_tick()`에 추가 | 코드 구현 필요 |
-| M3 수동 중 엔드스톱 방향 차단 | 현재 미구현, `m3_manual_tick()`에 추가 | 코드 구현 필요 |
+| M3 수동 중 물리 엔드스톱 방향 차단 | `m3_manual_tick()` | 구현됨, 반대 방향 탈출 허용 |
 | M4/M5 동시 모드 기본 속도 | `COUPLED_M4_BASE_SPEED_SPS` | 파라미터 |
 | 동시 모드 M4/M5 방향 | `COUPLED_M4_RETRACT_SIGN`, `COUPLED_M5_RETRACT_SIGN` | 파라미터 |
 | 가변저항의 M5 비율 범위 | `POT_RATIO_MIN/CENTER/MAX_X1000` | 파라미터 |
 | 100%/300% 모드 | `gain_pct` 계산과 `HAL_GPIO_EXTI_Callback()` | 코드 또는 UI 변경 |
 | Encoder 4 모드 순서 | `HAL_GPIO_EXTI_Callback()`의 `enc4_sel` 전환 | 코드 변경 |
-| SWV 출력 주기 | `SWV_REPORT_PERIOD_MS` | 파라미터 |
-| SWV 출력 내용 | `swv_report_manual()` | 코드 변경 |
+| 수동 UART 이벤트 | `apply_m12_limit()`, `m3_manual_tick()` | 코드 변경 |
 | TMC 초기화 재시도 | `TMC_INIT_RETRIES`, `TMC_INIT_RETRY_DELAY_MS` | 파라미터 |
 | 모터 운전 전류 | `motor_driver_init()`의 `TMC2209uart(500, ...)` | 코드 변경 |
 | STEP/DIR/EN 핀 또는 TMC 주소 | `mot[]` | 하드웨어 설정 |
@@ -589,7 +588,7 @@ SEL_M4 -> SEL_M5 -> SEL_M4_M5_COUPLED -> SEL_M4
 
 먼저 다음 순서로 확인한다.
 
-1. SWV에서 `current_pos`와 `target_pos` 차이가 계속 큰지 확인한다.
+1. UART 로그에서 `current_pos`와 `target_pos` 차이가 계속 큰지 확인한다.
 2. 축별 `MANUAL_MAX_SPEED_SPS`가 입력 속도를 따라갈 만큼 충분한지 확인한다.
 3. 축별 `MANUAL_ACCEL_SPS2`가 너무 낮지 않은지 확인한다.
 4. 조작 비율이 실제 필요한 값보다 지나치게 크지 않은지 확인한다.
@@ -708,33 +707,23 @@ M4/M5 동시: 점멸
 
 ---
 
-# 12. SWV 디버깅 내용을 수정하려면
+# 12. UART 디버깅 내용을 수정하려면
 
-## 출력 주기
+## 수동 운전 이벤트 출력
 
-```c
-#define SWV_REPORT_PERIOD_MS 200u
-```
+수동 운전 중 주기 텔레메트리는 제거되어 있다. 다음 이벤트가 비활성에서 활성으로 바뀔 때만 한 줄을 출력한다.
 
-값을 너무 작게 하면 ITM 출력이 제어 루프에 부담을 줄 수 있다.
+- `M1 MIN LIMIT` / `M1 MAX LIMIT`
+- `M2 MIN LIMIT` / `M2 MAX LIMIT`
+- `M3 MIN ENDSTOP`
 
-## 주기적으로 출력하는 항목
-
-`swv_report_manual()`을 수정한다. 현재 출력 항목은 다음과 같다.
-
-- M1/M2 현재 피드백 위치
-- M1/M2 안전 범위와 hard stop 범위
-- M1/M2 현재 limit 상태
-- M3 `current_pos`와 `target_pos`
-- M4/M5 `current_pos`
-- Encoder 4 선택 모드
-- M4/M5 동시 모드 속도 비율
+M1/M2는 `apply_m12_limit()`에서 모션을 먼저 정지한 뒤 이벤트를 출력한다. M3는 `m3_manual_tick()`에서 물리 endstop 방향 입력과 이미 누적된 같은 방향 모션을 정지하고, 반대 방향 탈출은 허용한다. limit 또는 endstop 해제 메시지는 출력하지 않는다.
 
 ## 부팅·호밍 메시지
 
-`main()`의 `swv_printf()` 호출과 `home_status_name()`을 확인한다.
+`main()`의 `uart_printf()` 호출과 `home_status_name()`을 확인한다.
 
-현재 디버깅 방식은 STM32CubeIDE SWV ITM Data Console이며 Core Clock은 84 MHz, Stimulus Port는 0이다. UART 출력은 아직 구현하지 않았다.
+현재 디버깅 방식은 USART2, 115200 baud, 8-N-1, flow control 없음이며 ST-LINK Virtual COM Port로 확인한다.
 
 ---
 
@@ -756,7 +745,7 @@ M4/M5 동시: 점멸
 
 1. 어느 hard stop을 기준으로 더 안쪽인지 실제 방향을 확인한다.
 2. `HOME_M1_RETURN2_DEG10`을 조금 키운다.
-3. SWV의 hard/safe 범위와 실제 정지 위치를 확인한다.
+3. UART 로그의 hard/safe 범위와 실제 정지 위치를 확인한다.
 4. 한 번에 큰 폭으로 바꾸지 않는다.
 
 ## “M3 원점을 엔드스톱에서 더 멀리 잡고 싶다”
@@ -794,7 +783,7 @@ M4/M5 동시: 점멸
 5. 처음에는 모터 전원을 즉시 차단할 수 있는 상태에서 시험한다.
 6. 호밍 변경 후 모든 축의 호밍 성공 및 실패 정지를 확인한다.
 7. 수동 변경 후 저속 입력, 빠른 입력, 방향 전환, 손을 놓은 뒤의 잔여 이동을 확인한다.
-8. M1/M2는 SWV의 `safe`, `hard`, `limit` 값을 확인한다.
+8. M1/M2는 UART 로그의 `safe`, `hard`, `limit` 값을 확인한다.
 9. M3는 엔드스톱 검출·해제와 실제 하한 높이를 확인한다.
 10. M4/M5는 세 모드 전환 시 이전 목표가 이어지지 않는지 확인한다.
 11. 확정된 실제 장비 값을 이 문서와 `FIRMWARE_GUIDE.md`에 함께 반영한다.
@@ -806,7 +795,6 @@ M4/M5 동시: 점멸
 - M1/M2 호밍의 최종 정지점은 실제 장비에서 확정해야 한다.
 - M1/M2 수동 제어와 한계 처리는 이식된 작동감을 실제 장비에서 검증해야 한다.
 - M3의 25,961/2,000 조작 비율과 27,000 STEP 원점 위치를 실제 장비에서 확인해야 한다.
-- M3 수동 상한·하한은 아직 구현되지 않았다.
-- M3 수동 운전 중 엔드스톱 방향 차단은 아직 구현되지 않았다.
+- M3 수동 물리 endstop 방향 차단은 구현됐지만 소프트웨어 상한·하한은 아직 구현되지 않았다.
 - 수동 조작 중 `target_pos`가 과도하게 누적되는지 확인해야 한다.
-- UART 상태 출력은 아직 구현하지 않았으며 현재는 SWV를 사용한다.
+- UART 상태 출력은 USART2 blocking 송신으로 구현되어 있으며, 필요 시 interrupt 또는 DMA 기반 queue로 변경한다.
