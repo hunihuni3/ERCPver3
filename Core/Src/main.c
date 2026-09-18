@@ -68,6 +68,25 @@
 #define UART_BAUD_RATE                          115200u
 #define UART_TX_TIMEOUT_MS                          30u
 
+#define M1_RUN_CURRENT_MA                         1000u
+#define M2_RUN_CURRENT_MA                         1000u
+#define M3_RUN_CURRENT_MA                          800u
+#define M4_RUN_CURRENT_MA                         1000u
+#define M5_RUN_CURRENT_MA                         1000u
+
+/* ===== Application mode selection ======================================== */
+#define APP_MODE_INTEGRATED_CONTROL                  0u
+#define APP_MODE_M23_FEEDER                          1u
+#ifndef ACTIVE_APP_MODE
+#define ACTIVE_APP_MODE              APP_MODE_INTEGRATED_CONTROL
+#endif
+
+/* ===== M2/M3 feeder drive ================================================ */
+#define M23_FEEDER_STAGE_COUNT                       7u
+#define M23_FEEDER_STAGE_MS                      10000u
+#define M2_FEEDER_DIRECTION                         (-1)
+#define M3_FEEDER_DIRECTION                         (-M2_FEEDER_DIRECTION)
+
 /* ===== Manual-control values shared by all axes ========================== */
 #define MANUAL_FIXED_GAIN_PCT                       100
 #define MANUAL_STOP_SPEED_EPSILON_SPS              0.5f
@@ -86,20 +105,26 @@
 
 /* ===== M3 manual control ================================================= */
 #define M3_MANUAL_SCALE_NUM                       25961L
-#define M3_MANUAL_SCALE_DEN                        2000L
-#define M3_MANUAL_MAX_SPEED_SPS                 51200.0f
-#define M3_MANUAL_ACCEL_SPS2                   160000.0f
-
-/* M3 manual min/max limits are not implemented yet. */
+#define M3_MANUAL_SCALE_DEN                        1150L
+#define M3_MANUAL_MAX_SPEED_SPS                120000.0f
+#define M3_MANUAL_ACCEL_SPS2                    80000.0f
+#define M3_POSITION_REPORT_PERIOD_MS                1000u
 
 /* ===== M3 homing ========================================================= */
 #define M3_ENDSTOP_ACTIVE_STATE              GPIO_PIN_SET
 #define M3_HOME_SEEK_DIRECTION                       (-1)
-#define M3_HOME_SEEK_MAX_STEPS                     64000u
+#define M3_HOME_SEEK_MAX_STEPS                    128000u
 #define M3_HOME_SEEK_RATE_SPS                        6000u
-#define M3_HOME_BACKOFF_STEPS                       27000u
+#define M3_HOME_BACKOFF_STEPS                       22000u
+#define M3_HOME_BACKOFF_START_RATE_SPS                300u
 #define M3_HOME_BACKOFF_RATE_SPS                     6000u
-#define M3_HOME_SETTLE_MS                              10u
+#define M3_HOME_BACKOFF_RAMP_STEPS                   1500u
+#define M3_HOME_RELEASE_MAX_STEPS                    3000u
+#define M3_HOME_RELEASE_CONFIRM_STEPS                   8u
+#define M3_HOME_SETTLE_MS                             100u
+
+/* Keep the physical endstop latched until M3 has backed away this far. */
+#define M3_MANUAL_LIMIT_RELEASE_STEPS                   50L
 
 /* ===== M4/M5 manual and coupled control ================================== */
 #define M45_MANUAL_MAX_SPEED_SPS                51200.0f
@@ -315,6 +340,13 @@ static Motor mot[MOTOR_COUNT] = {
 };
 
 static uint8_t motor_ready[MOTOR_COUNT] = {0};
+static const uint16_t motor_run_current_ma[MOTOR_COUNT] = {
+    [MOTOR_M1_INDEX] = M1_RUN_CURRENT_MA,
+    [MOTOR_M2_INDEX] = M2_RUN_CURRENT_MA,
+    [MOTOR_M3_INDEX] = M3_RUN_CURRENT_MA,
+    [MOTOR_M4_INDEX] = M4_RUN_CURRENT_MA,
+    [MOTOR_M5_INDEX] = M5_RUN_CURRENT_MA,
+};
 
 typedef enum {
     SEL_M4 = 0,
@@ -404,7 +436,7 @@ static uint8_t motor_driver_init(uint8_t mi)
     HAL_GPIO_WritePin(m->en_port, m->en_pin, GPIO_PIN_SET);
 
     for (uint32_t attempt = 1u; attempt <= TMC_INIT_RETRIES; attempt++) {
-        TMC_Status_t status = TMC2209uart(500, MICROSTEP,
+        TMC_Status_t status = TMC2209uart(motor_run_current_ma[mi], MICROSTEP,
                                          m->pdn_port, m->pdn_pin, m->tmc_addr);
         if (status == TMC_OK) {
             motor_ready[mi] = 1u;
@@ -417,6 +449,72 @@ static uint8_t motor_driver_init(uint8_t mi)
 
     return 0u;
 }
+
+#if ACTIVE_APP_MODE == APP_MODE_M23_FEEDER
+static inline void m23_feeder_step_pulse(Motor *m2, Motor *m3)
+{
+    if (m2->step_port == m3->step_port) {
+        uint16_t step_pins = (uint16_t)(m2->step_pin | m3->step_pin);
+
+        HAL_GPIO_WritePin(m2->step_port, step_pins, GPIO_PIN_SET);
+        dwt_delay_cycles(STEP_PULSE_CYCLES);
+        HAL_GPIO_WritePin(m2->step_port, step_pins, GPIO_PIN_RESET);
+        dwt_delay_cycles(STEP_PULSE_CYCLES);
+        return;
+    }
+
+    HAL_GPIO_WritePin(m2->step_port, m2->step_pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(m3->step_port, m3->step_pin, GPIO_PIN_SET);
+    dwt_delay_cycles(STEP_PULSE_CYCLES);
+    HAL_GPIO_WritePin(m2->step_port, m2->step_pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(m3->step_port, m3->step_pin, GPIO_PIN_RESET);
+    dwt_delay_cycles(STEP_PULSE_CYCLES);
+}
+
+static void m23_feeder_run(void)
+{
+    static const uint32_t stage_speed_sps[M23_FEEDER_STAGE_COUNT] = {
+        1200u, 1200u, 1700u, 1700u, 1200u, 1200u, 1700u
+    };
+    Motor *m2 = &mot[MOTOR_M2_INDEX];
+    Motor *m3 = &mot[MOTOR_M3_INDEX];
+
+    HAL_GPIO_WritePin(m2->dir_port, m2->dir_pin,
+                      (M2_FEEDER_DIRECTION > 0) ?
+                      GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(m3->dir_port, m3->dir_pin,
+                      (M3_FEEDER_DIRECTION > 0) ?
+                      GPIO_PIN_SET : GPIO_PIN_RESET);
+    dwt_delay_cycles(SystemCoreClock / 100000u);
+
+    while (1) {
+        for (uint32_t stage = 0u; stage < M23_FEEDER_STAGE_COUNT;
+             stage++) {
+            uint32_t speed_sps = stage_speed_sps[stage];
+            uint32_t step_period_cycles = SystemCoreClock / speed_sps;
+            uint32_t stage_start_ms = HAL_GetTick();
+            uint32_t last_step_cyc = DWT->CYCCNT;
+
+            uart_printf("M2/M3 FEEDER STAGE %lu/%lu: %lu SPS, %lu ms, "
+                        "OPPOSITE DIR\r\n",
+                        (unsigned long)(stage + 1u),
+                        (unsigned long)M23_FEEDER_STAGE_COUNT,
+                        (unsigned long)speed_sps,
+                        (unsigned long)M23_FEEDER_STAGE_MS);
+
+            while ((uint32_t)(HAL_GetTick() - stage_start_ms) <
+                   M23_FEEDER_STAGE_MS) {
+                uint32_t now_cyc = DWT->CYCCNT;
+                if ((uint32_t)(now_cyc - last_step_cyc) >=
+                    step_period_cycles) {
+                    last_step_cyc = now_cyc;
+                    m23_feeder_step_pulse(m2, m3);
+                }
+            }
+        }
+    }
+}
+#endif
 
 /* current_pos counts emitted STEP pulses; it is not encoder feedback. */
 static void control_tick(Motor *m, float dt,
@@ -504,7 +602,6 @@ static void reset_m4_m5_motion_state(void)
 
 
 /* Encoder homing for M1/M2. Values come from the latest verified M2/M3 code. */
-#define HOME_NORMAL_CURRENT_MA       500u
 #define HOME_M1_TOUCH_CURRENT_MA     175u
 #define HOME_M2_TOUCH_CURRENT_MA     300u
 #define HOME_APPROACH_V              800u
@@ -607,6 +704,7 @@ typedef struct {
 
 static ManualLimit m12_limit[2] = {0};
 static uint8_t m3_manual_endstop_latched = 0u;
+static int32_t m3_manual_endstop_position = 0;
 
 static HomeStatus m3_home_begin(void);
 static HomeStatus m3_home_service(void);
@@ -717,7 +815,8 @@ static HomeStatus home_set_axis_currents(uint8_t touch_mode)
         const HomeAxis *a = &home_ax[i];
         Motor *m = &mot[a->mi];
         uint16_t current = touch_mode ?
-                           a->touch_current_ma : HOME_NORMAL_CURRENT_MA;
+                           a->touch_current_ma :
+                           motor_run_current_ma[a->mi];
         TMC_Status_t tmc_status = TMC_ERR_NO_REPLY;
 
         if (motor_ready[a->mi])
@@ -1043,6 +1142,9 @@ typedef struct {
     uint32_t settle_ms;
     uint32_t seek_steps;
     uint32_t backoff_steps;
+    uint32_t release_step;
+    uint8_t release_confirm;
+    uint8_t release_seen;
 } M3HomeContext;
 
 static M3HomeContext m3_home = {0};
@@ -1068,8 +1170,13 @@ static HomeStatus m3_home_begin(void)
     m3_home.error = HOME_OK;
     m3_home.seek_steps = 0u;
     m3_home.backoff_steps = 0u;
+    m3_home.release_step = 0u;
+    m3_home.release_confirm = 0u;
+    m3_home.release_seen = 0u;
 
     if (m3_endstop_active()) {
+        uart_printf("M3 HOME ENDSTOP seek_steps=0 backoff=%lu\r\n",
+                    (unsigned long)M3_HOME_BACKOFF_STEPS);
         m3_home.settle_ms = HAL_GetTick();
         m3_home.state = M3_HOME_SEEK_SETTLE;
     } else {
@@ -1084,11 +1191,15 @@ static HomeStatus m3_home_service(void)
 {
     Motor *m = &mot[2];
     uint32_t now;
+    uint32_t backoff_rate_sps;
 
     switch (m3_home.state) {
     case M3_HOME_SEEK:
         if (m3_endstop_active()) {
             HAL_GPIO_WritePin(m->step_port, m->step_pin, GPIO_PIN_RESET);
+            uart_printf("M3 HOME ENDSTOP seek_steps=%lu backoff=%lu\r\n",
+                        (unsigned long)m3_home.seek_steps,
+                        (unsigned long)M3_HOME_BACKOFF_STEPS);
             m3_home.settle_ms = HAL_GetTick();
             m3_home.state = M3_HOME_SEEK_SETTLE;
             return HOME_OK;
@@ -1105,9 +1216,19 @@ static HomeStatus m3_home_service(void)
 
         if (m3_endstop_active()) {
             HAL_GPIO_WritePin(m->step_port, m->step_pin, GPIO_PIN_RESET);
+            uart_printf("M3 HOME ENDSTOP seek_steps=%lu backoff=%lu\r\n",
+                        (unsigned long)m3_home.seek_steps,
+                        (unsigned long)M3_HOME_BACKOFF_STEPS);
             m3_home.settle_ms = HAL_GetTick();
             m3_home.state = M3_HOME_SEEK_SETTLE;
         } else if (m3_home.seek_steps >= M3_HOME_SEEK_MAX_STEPS) {
+            uart_printf("M3 HOME NO ENDSTOP seek_steps=%lu raw=%u dir_pin=%u\r\n",
+                        (unsigned long)m3_home.seek_steps,
+                        (unsigned)(HAL_GPIO_ReadPin(M3_ENDSTOP_GPIO_Port,
+                                                   M3_ENDSTOP_Pin) ==
+                                   GPIO_PIN_SET),
+                        (unsigned)(HAL_GPIO_ReadPin(m->dir_port, m->dir_pin) ==
+                                   GPIO_PIN_SET));
             return m3_home_fail(HOME_NO_HARDSTOP);
         }
         return HOME_OK;
@@ -1118,22 +1239,74 @@ static HomeStatus m3_home_service(void)
             return HOME_OK;
 
         m3_home_set_direction(m, (int8_t)-M3_HOME_SEEK_DIRECTION);
+        uart_printf("M3 HOME BACKOFF START dir_pin=%u start=%lu max=%lu\r\n",
+                    (unsigned)(HAL_GPIO_ReadPin(m->dir_port, m->dir_pin) ==
+                               GPIO_PIN_SET),
+                    (unsigned long)M3_HOME_BACKOFF_START_RATE_SPS,
+                    (unsigned long)M3_HOME_BACKOFF_RATE_SPS);
         m3_home.tick = DWT->CYCCNT;
         m3_home.state = M3_HOME_BACKOFF;
         return HOME_OK;
 
     case M3_HOME_BACKOFF:
+        backoff_rate_sps = M3_HOME_BACKOFF_RATE_SPS;
+        if (m3_home.backoff_steps < M3_HOME_BACKOFF_RAMP_STEPS) {
+            backoff_rate_sps =
+                M3_HOME_BACKOFF_START_RATE_SPS +
+                (uint32_t)(((uint64_t)(M3_HOME_BACKOFF_RATE_SPS -
+                                       M3_HOME_BACKOFF_START_RATE_SPS) *
+                            m3_home.backoff_steps) /
+                           M3_HOME_BACKOFF_RAMP_STEPS);
+        }
+
         now = DWT->CYCCNT;
         if ((uint32_t)(now - m3_home.tick) <
-            SystemCoreClock / M3_HOME_BACKOFF_RATE_SPS)
+            SystemCoreClock / backoff_rate_sps)
             return HOME_OK;
 
         m3_home.tick = now;
         step_pulse(m->step_port, m->step_pin);
         m3_home.backoff_steps++;
 
+        if (!m3_home.release_seen) {
+            if (!m3_endstop_active()) {
+                if (m3_home.release_confirm <
+                    M3_HOME_RELEASE_CONFIRM_STEPS)
+                    m3_home.release_confirm++;
+            } else {
+                m3_home.release_confirm = 0u;
+            }
+
+            if (m3_home.release_confirm >=
+                M3_HOME_RELEASE_CONFIRM_STEPS) {
+                m3_home.release_seen = 1u;
+                m3_home.release_step = m3_home.backoff_steps;
+                uart_printf("M3 HOME ENDSTOP RELEASED step=%lu\r\n",
+                            (unsigned long)m3_home.release_step);
+            } else if (m3_home.backoff_steps >=
+                       M3_HOME_RELEASE_MAX_STEPS) {
+                HAL_GPIO_WritePin(m->step_port, m->step_pin,
+                                  GPIO_PIN_RESET);
+                uart_printf("M3 HOME BACKOFF STALL steps=%lu raw=%u dir_pin=%u\r\n",
+                            (unsigned long)m3_home.backoff_steps,
+                            (unsigned)(HAL_GPIO_ReadPin(
+                                           M3_ENDSTOP_GPIO_Port,
+                                           M3_ENDSTOP_Pin) == GPIO_PIN_SET),
+                            (unsigned)(HAL_GPIO_ReadPin(
+                                           m->dir_port, m->dir_pin) ==
+                                       GPIO_PIN_SET));
+                return m3_home_fail(HOME_SWITCH_NOT_RELEASED);
+            }
+        }
+
         if (m3_home.backoff_steps >= M3_HOME_BACKOFF_STEPS) {
             HAL_GPIO_WritePin(m->step_port, m->step_pin, GPIO_PIN_RESET);
+            uart_printf("M3 HOME BACKOFF DONE steps=%lu release_step=%lu raw=%u\r\n",
+                        (unsigned long)m3_home.backoff_steps,
+                        (unsigned long)m3_home.release_step,
+                        (unsigned)(HAL_GPIO_ReadPin(M3_ENDSTOP_GPIO_Port,
+                                                   M3_ENDSTOP_Pin) ==
+                                   GPIO_PIN_SET));
             m3_home.settle_ms = HAL_GetTick();
             m3_home.state = M3_HOME_RELEASE_SETTLE;
         }
@@ -1168,6 +1341,16 @@ static uint8_t m3_home_finished(void)
 
 static void m3_home_abort(void)
 {
+    if (m3_home.state == M3_HOME_SEEK_SETTLE ||
+        m3_home.state == M3_HOME_BACKOFF ||
+        m3_home.state == M3_HOME_RELEASE_SETTLE) {
+        uart_printf("M3 HOME SAFE BACKOFF BEFORE ABORT\r\n");
+        while (!m3_home_finished() &&
+               m3_home.state != M3_HOME_FAILED) {
+            if (m3_home_service() != HOME_OK)
+                break;
+        }
+    }
     HAL_GPIO_WritePin(mot[2].step_port, mot[2].step_pin, GPIO_PIN_RESET);
 }
 
@@ -1179,15 +1362,8 @@ static void resync_input_encoders(void)
 
 /* ============ Post-homing manual control ============ */
 
-static void manual_position_tick(uint8_t mi, int32_t input,
-                                 int32_t gain_pct, float dt,
-                                 float max_speed_sps, float accel_sps2)
+static void manual_target_update(Motor *m, int32_t input, int32_t gain_pct)
 {
-    Motor *m = &mot[mi];
-
-    if (!motor_ready[mi])
-        return;
-
     int64_t one_step =
         (int64_t)100 * INPUT_COUNT_TO_MICROSTEP_DEN *
         m->manual_scale_den;
@@ -1204,7 +1380,18 @@ static void manual_position_tick(uint8_t mi, int32_t input,
         m->accum_num += one_step;
         m->target_pos--;
     }
+}
 
+static void manual_position_tick(uint8_t mi, int32_t input,
+                                 int32_t gain_pct, float dt,
+                                 float max_speed_sps, float accel_sps2)
+{
+    Motor *m = &mot[mi];
+
+    if (!motor_ready[mi])
+        return;
+
+    manual_target_update(m, input, gain_pct);
     control_tick(m, dt, max_speed_sps, accel_sps2);
 }
 
@@ -1222,41 +1409,91 @@ static void m12_manual_tick(uint8_t axis, int32_t input, float dt)
 static void m3_manual_tick(int32_t input, float dt)
 {
     Motor *m = &mot[MOTOR_M3_INDEX];
+
+    if (!motor_ready[MOTOR_M3_INDEX])
+        return;
+
+    int32_t raw_input = input;
     uint8_t endstop_active = m3_endstop_active();
+    uint8_t endstop_activated = 0u;
 
-    if (endstop_active) {
-        uint8_t moving_toward_endstop =
-            input < 0 ||
-            m->target_pos < m->current_pos ||
-            m->vel < 0.0f;
-
-        if (input < 0) {
-            input = 0;
-            m->accum_num = 0;
-        }
-        if (moving_toward_endstop)
-            stop_motor_motion(m);
-
-        if (!m3_manual_endstop_latched) {
-            m3_manual_endstop_latched = 1u;
-            uart_printf("M3 MIN ENDSTOP pos=%ld\r\n",
-                        (long)m->current_pos);
-        }
-    } else {
-        m3_manual_endstop_latched = 0u;
+    if (!m3_manual_endstop_latched && endstop_active) {
+        m3_manual_endstop_latched = 1u;
+        m3_manual_endstop_position = m->current_pos;
+        endstop_activated = 1u;
+    } else if (m3_manual_endstop_latched && !endstop_active) {
+        uint8_t released_by_position =
+            (M3_HOME_SEEK_DIRECTION < 0) ?
+            (m->current_pos >= m3_manual_endstop_position +
+                               M3_MANUAL_LIMIT_RELEASE_STEPS) :
+            (m->current_pos <= m3_manual_endstop_position -
+                               M3_MANUAL_LIMIT_RELEASE_STEPS);
+        if (released_by_position)
+            m3_manual_endstop_latched = 0u;
     }
 
-    manual_position_tick(MOTOR_M3_INDEX, input, MANUAL_FIXED_GAIN_PCT,
-                         dt, M3_MANUAL_MAX_SPEED_SPS,
-                         M3_MANUAL_ACCEL_SPS2);
+    int32_t input_direction = input * m->dir_sign;
+    uint8_t input_toward_endstop =
+        (M3_HOME_SEEK_DIRECTION < 0) ?
+        (input_direction < 0) : (input_direction > 0);
+    if (m3_manual_endstop_latched && input_toward_endstop) {
+        input = 0;
+        m->accum_num = 0;
+    }
+
+    int32_t position_error = m->target_pos - m->current_pos;
+    uint8_t target_toward_endstop =
+        (M3_HOME_SEEK_DIRECTION < 0) ?
+        (position_error < 0 || m->vel < 0.0f) :
+        (position_error > 0 || m->vel > 0.0f);
+    if (m3_manual_endstop_latched && target_toward_endstop)
+        stop_motor_motion(m);
+
+    /*
+     * When the operator reverses M3, discard motion queued in the old
+     * direction. Keep the current velocity so control_tick() decelerates and
+     * reverses it using M3_MANUAL_ACCEL_SPS2 instead of changing it abruptly.
+     */
+    position_error = m->target_pos - m->current_pos;
+    uint8_t input_reverses_queued_motion =
+        (input_direction > 0 && position_error < 0) ||
+        (input_direction < 0 && position_error > 0);
+    if (input_reverses_queued_motion) {
+        m->target_pos = m->current_pos;
+        m->accum_num = 0;
+        m->emit_accum = 0.0f;
+    }
+
+    /* Report a newly reached limit only after outward motion stops. */
+    if (endstop_activated)
+        uart_printf("M3 MIN ENDSTOP lower_steps=%ld\r\n",
+                    (long)m3_manual_endstop_position);
+
+    manual_target_update(m, input, MANUAL_FIXED_GAIN_PCT);
+    control_tick(m, dt, M3_MANUAL_MAX_SPEED_SPS,
+                 M3_MANUAL_ACCEL_SPS2);
+
+    static uint32_t last_report_ms = 0u;
+    uint32_t now_ms = HAL_GetTick();
+    uint8_t motion_active =
+        raw_input != 0 ||
+        m->target_pos != m->current_pos ||
+        fabsf(m->vel) >= MANUAL_STOP_SPEED_EPSILON_SPS;
+    if (!endstop_activated && motion_active &&
+        (uint32_t)(now_ms - last_report_ms) >=
+        M3_POSITION_REPORT_PERIOD_MS) {
+        last_report_ms = now_ms;
+        uart_printf("M3 POS current_steps=%ld target_steps=%ld lag_steps=%ld\r\n",
+                    (long)m->current_pos, (long)m->target_pos,
+                    (long)(m->target_pos - m->current_pos));
+    }
 }
 
 static void m45_manual_tick(Enc4Sel selected, int32_t input,
                             int32_t gain_pct, float dt)
 {
     if (selected == SEL_M4_M5_COUPLED) {
-        float m4_speed =
-            COUPLED_M4_BASE_SPEED_SPS * ((float)gain_pct / 100.0f);
+        float m4_speed = COUPLED_M4_BASE_SPEED_SPS;
 
         if (motor_ready[MOTOR_M4_INDEX]) {
             coupled_velocity_tick(
@@ -1331,6 +1568,35 @@ int main(void)
     HAL_GPIO_WritePin(mot[m].en_port, mot[m].en_pin, GPIO_PIN_SET);
 
   dwt_delay_init();
+#if ACTIVE_APP_MODE == APP_MODE_M23_FEEDER
+  uart_printf("BOOT: M2/M3 FEEDER DRIVE\r\n");
+
+  HAL_Delay(100u);
+  tmc_write_nodeconf(mot[MOTOR_M2_INDEX].pdn_port,
+                     mot[MOTOR_M2_INDEX].pdn_pin,
+                     mot[MOTOR_M2_INDEX].tmc_addr, 2);
+  tmc_write_nodeconf(mot[MOTOR_M3_INDEX].pdn_port,
+                     mot[MOTOR_M3_INDEX].pdn_pin,
+                     mot[MOTOR_M3_INDEX].tmc_addr, 2);
+  HAL_Delay(10u);
+
+  uint8_t m2_ready = motor_driver_init(MOTOR_M2_INDEX);
+  uint8_t m3_ready = motor_driver_init(MOTOR_M3_INDEX);
+  uart_printf("M2 DRIVER %s\r\n", m2_ready ? "OK" : "ERROR");
+  uart_printf("M3 DRIVER %s\r\n", m3_ready ? "OK" : "ERROR");
+
+  if (!m2_ready || !m3_ready) {
+    HAL_GPIO_WritePin(mot[MOTOR_M2_INDEX].en_port,
+                      mot[MOTOR_M2_INDEX].en_pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(mot[MOTOR_M3_INDEX].en_port,
+                      mot[MOTOR_M3_INDEX].en_pin, GPIO_PIN_SET);
+    Error_Handler();
+  }
+
+  uart_printf("M2/M3 DRIVERS OK: FEEDER START\r\n");
+  m23_feeder_run();
+#endif
+
   uart_printf("BOOT: M1 M2 M3 M4 M5 CONTROL\r\n");
   HAL_TIM_Encoder_Start(&htim5, TIM_CHANNEL_ALL);
   HAL_TIM_Encoder_Start(&htim8, TIM_CHANNEL_ALL);
@@ -1369,7 +1635,7 @@ int main(void)
              (long)m12_limit[1].hard_max_count,
              (long)m12_limit[1].min_count,
              (long)m12_limit[1].max_count);
-  uart_printf("M3 HOME OK\r\n");
+  uart_printf("M3 HOME OK lower=ENDSTOP upper=MECHANICAL origin=0\r\n");
 
   /* Phase 4: initialize M4/M5 only after homing has succeeded. */
   for (int m = MOTOR_M4_INDEX; m < MOTOR_COUNT; m++)
@@ -1936,7 +2202,7 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin : M3_ENDSTOP */
   GPIO_InitStruct.Pin = M3_ENDSTOP_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(M3_ENDSTOP_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pin : PD2 */

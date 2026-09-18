@@ -98,7 +98,7 @@ INPUT_ENCODER_COUNTS_PER_REV
 - `BUTTON_DEBOUNCE_MS=200`: 같은 버튼에서 200 ms 이내에 다시 발생한 인터럽트를 무시한다.
 - `UART_BAUD_RATE=115200`: USART2 디버그 출력 속도다.
 - `UART_TX_TIMEOUT_MS=30`: blocking UART 송신의 최대 대기 시간이다.
-- 수동 운전 중 주기 텔레메트리는 출력하지 않는다. M1/M2 limit 또는 M3 물리 endstop이 처음 활성화될 때만 이벤트를 출력한다.
+- M1/M2는 수동 운전 중 주기 텔레메트리를 출력하지 않는다. M3는 물리 MIN endstop 이벤트와 위쪽 기계 한계 측정을 위한 1000 ms 위치 텔레메트리를 출력한다.
 
 ## Manual-control values shared by all axes
 
@@ -136,35 +136,41 @@ margin 단위는 motor step이 아니라 TIM5/TIM8 피드백 count다. release �
 ## M3 manual control
 
 ```text
-M3: 3200/8192 x 25961/2000
-  = 약 5.07 microsteps/input count
+M3: 3200/8192 x 25961/1150
+  = 약 8.82 microsteps/input count
 ```
 
-- `M3_MANUAL_SCALE_NUM/DEN=25961/2000`
-- `M3_MANUAL_MAX_SPEED_SPS=51200`
-- `M3_MANUAL_ACCEL_SPS2=160000`
+- `M3_MANUAL_SCALE_NUM/DEN=25961/1150`
+- `M3_MANUAL_MAX_SPEED_SPS=120000`
+- `M3_MANUAL_ACCEL_SPS2=80000`
+- `M3_POSITION_REPORT_PERIOD_MS=1000`: M3가 움직이는 동안 현재·목표 STEP을 UART로 출력하는 주기다.
+- `M3_MANUAL_LIMIT_RELEASE_STEPS=50`: 물리 하한 endstop의 release hysteresis다.
 
-M3 값은 M12와 분리되어 있으므로 M3 조작감만 독립적으로 조정할 수 있다.
+M3 값은 M12와 분리되어 있으므로 M3 조작감만 독립적으로 조정할 수 있다. 기존 250000 SPS²에서는 급가속 시 탈조가 발생해 현재 80000 SPS²로 낮췄다.
 
-현재 M3 수동 상한, 하한, 엔드스톱 방향 차단은 구현되지 않았다.
+M3 하한에는 고정 소프트웨어 위치를 사용하지 않는다. 수동 운전 중 실제 물리 엔드스톱이 눌리면 그 순간의 `current_pos`를 하한 접촉 위치로 기록하고, 하한 방향 입력과 이미 누적된 모션을 정지한다. 소프트웨어 상한도 사용하지 않으며 위쪽 기계적 hard stop 위치는 이동 중 UART 텔레메트리로 확인한다.
 
 ## M3 homing
 
 - `M3_ENDSTOP_ACTIVE_STATE=GPIO_PIN_SET`: 엔드스톱 GPIO가 HIGH일 때 눌린 상태다.
 - `M3_HOME_SEEK_DIRECTION=-1`: 엔드스톱 탐색 시 DIR LOW가 되는 논리 방향이다.
-- `M3_HOME_SEEK_MAX_STEPS=64000`: 이 거리 안에 스위치를 찾지 못하면 오류다.
+- `M3_HOME_SEEK_MAX_STEPS=128000`: 이 거리 안에 스위치를 찾지 못하면 오류다.
 - `M3_HOME_SEEK_RATE_SPS=6000`: 탐색 속도다.
-- `M3_HOME_BACKOFF_STEPS=27000`: 스위치 감지 후 반대 방향 이동 거리다.
-- `M3_HOME_BACKOFF_RATE_SPS=6000`: 후퇴 속도다.
-- `M3_HOME_SETTLE_MS=10`: 스위치 감지 또는 후퇴 완료 후 안정화 시간이다.
+- `M3_HOME_BACKOFF_STEPS=22000`: 스위치 감지 후 반대 방향 이동 거리다.
+- `M3_HOME_BACKOFF_START_RATE_SPS=300`: 후퇴를 시작하는 속도다.
+- `M3_HOME_BACKOFF_RATE_SPS=6000`: 후퇴 최고속도다.
+- `M3_HOME_BACKOFF_RAMP_STEPS=1500`: 시작 속도에서 최고속도까지 올리는 STEP 구간이다.
+- `M3_HOME_RELEASE_MAX_STEPS=3000`: 이 거리 안에 스위치가 해제되지 않으면 오류다.
+- `M3_HOME_RELEASE_CONFIRM_STEPS=8`: 스위치 비활성을 연속 확인하는 STEP 수다.
+- `M3_HOME_SETTLE_MS=100`: 스위치 감지 또는 후퇴 완료 후 안정화 시간이다.
 
-현재 코드는 27000 step 후퇴한 위치를 0으로 초기화한다. 따라서 엔드스톱 눌림 위치는 이론상 약 -27000이다.
+현재 코드는 300 SPS로 후퇴를 시작해 첫 1500 STEP 동안 6000 SPS까지 올리고, 총 22000 STEP 후퇴한 위치를 0으로 초기화한다. 후퇴 중 엔드스톱이 실제로 해제되는지 확인하며 3000 STEP 안에 해제되지 않으면 `HOME_SWITCH_NOT_RELEASED`로 실패한다. 수동 하한 좌표는 이후 실제 엔드스톱을 다시 눌렀을 때의 `current_pos`로 확인한다.
 
 ## M4/M5 manual and coupled control
 
 - `M45_MANUAL_MAX_SPEED_SPS=51200`: 단독 위치제어 최대 속도다.
 - `M45_MANUAL_ACCEL_SPS2=160000`: 단독·동시 제어 가속도다.
-- `COUPLED_M4_BASE_SPEED_SPS=800`: 동시 모드 M4의 100% 기준 속도다. 300% 모드에서는 2400 SPS다.
+- `COUPLED_M4_BASE_SPEED_SPS=800`: 동시 모드 M4의 고정 속도다. 동시 모드에는 100%/300% gain을 적용하지 않는다.
 - `COUPLED_M4_RETRACT_SIGN=+1`
 - `COUPLED_M5_RETRACT_SIGN=-1`
 
@@ -394,7 +400,7 @@ in_enc[3] -> TIM4 -> Encoder 4 -> M4/M5, 16비트
 |---|---|---|---|---|---:|---:|---:|
 | M1 | PC1 | PC2 | PC0 | PB0 | 0 | 95/26 | -1 |
 | M2 | PC4 | PC5 | PC3 | PB0 | 1 | 171/181 | +1 |
-| M3 | PC9 | PC10 | PC8 | PB0 | 2 | 25961/2000 | +1 |
+| M3 | PC9 | PC10 | PC8 | PB0 | 2 | 25961/1150 | +1 |
 | M4 | PC12 | PC13 | PC11 | PB0 | 3 | 1/1 | +1 |
 | M5 | PA11 | PD2 | PA12 | PB1 | 0 | 1/1 | +1 |
 
@@ -459,7 +465,7 @@ filtered += (raw - filtered) / 8
 ```text
 motor_ready=0
 -> EN HIGH로 disable
--> TMC2209uart(500 mA, 16 microsteps) 최대 3회 시도
+-> motor_run_current_ma[]의 축별 전류와 16 microsteps로 최대 3회 시도
 -> 성공: motor_ready=1, EN LOW, return 1
 -> 실패: disable 유지, return 0
 ```
@@ -604,7 +610,7 @@ HomeAxis의 16/32비트 설정에 맞게 feedback count 차이를 계산하고 w
 
 ### 수동 limit 이벤트 UART
 
-주기 상태 출력 함수는 사용하지 않는다. `apply_m12_limit()`은 M1/M2의 MIN/MAX가 비활성에서 활성으로 바뀔 때만 이벤트를 출력하고, `m3_manual_tick()`은 M3 물리 endstop이 새로 활성화될 때만 이벤트를 출력한다. 해제 이벤트와 정상 수동 운전 상태는 출력하지 않는다.
+`apply_m12_limit()`은 M1/M2의 MIN/MAX가 비활성에서 활성으로 바뀔 때만 이벤트를 출력한다. `m3_manual_tick()`은 물리 MIN endstop이 새로 활성화될 때 이벤트를 출력하고, M3가 움직이는 동안 `M3 POS current_steps=... target_steps=... lag_steps=...`을 1000 ms마다 출력한다. endstop 해제 이벤트는 출력하지 않는다.
 
 ### `home_set_direction()`
 
@@ -681,7 +687,7 @@ IDLE
 
 ## `M3HomeContext`와 `m3_home`
 
-현재 상태, 오류, 마지막 STEP cycle, settle 시작 ms, seek STEP 수, backoff STEP 수를 저장한다. 전역 상태이므로 M1/M2 blocking 호밍 중 여러 번 service할 수 있다.
+현재 상태, 오류, 마지막 STEP cycle, settle 시작 ms, seek/backoff STEP 수, 엔드스톱 해제 STEP과 연속 확인 상태를 저장한다. 전역 상태이므로 M1/M2 blocking 호밍 중 여러 번 service할 수 있다.
 
 ## `m3_home_fail()`
 
@@ -696,16 +702,18 @@ STEP 핀을 LOW로 만들고 상태와 오류를 FAILED로 저장한다.
 한 번 호출할 때 현재 상태에서 필요한 작업을 조금씩 진행한다.
 
 - `SEEK`: 속도 간격마다 STEP 1개 출력, 스위치와 최대 거리 확인
-- `SEEK_SETTLE`: 10 ms 후 반대 방향 설정
-- `BACKOFF`: 27000 STEP까지 후퇴
-- `RELEASE_SETTLE`: 10 ms 후 스위치 해제 확인
+- 엔드스톱 최초 감지: STEP을 LOW로 만든 뒤 탐색 STEP 수와 `backoff=22000`을 UART로 출력
+- `SEEK_SETTLE`: 100 ms 후 반대 방향 설정
+- `BACKOFF`: 300 SPS에서 6000 SPS까지 가속하며 22000 STEP 후퇴
+- `BACKOFF`: 3000 STEP 안에 스위치가 8 STEP 연속 해제되는지 확인
+- `RELEASE_SETTLE`: 100 ms 후 스위치 해제 상태 최종 확인
 - 완료: 모션 상태 0 초기화 후 DONE
 
 함수 한 번으로 전체 호밍을 끝내지 않으므로 M1/M2 호밍의 대기 구간에서 계속 호출해야 한다.
 
 ## `m3_home_finished()`와 `m3_home_abort()`
 
-`m3_home_finished()`는 DONE일 때만 1이다. `m3_home_abort()`는 STEP 핀을 LOW로 만들지만 상태 전체를 초기화하지는 않는다.
+`m3_home_finished()`는 DONE일 때만 1이다. `m3_home_abort()`가 settle 또는 backoff 구간에서 호출되면 안전한 후퇴 완료를 먼저 시도한 뒤 STEP 핀을 LOW로 만든다.
 
 ## `resync_input_encoders()`
 
@@ -736,13 +744,19 @@ M1/M2 축인지 확인하고 `apply_m12_limit()`을 먼저 적용한다. 이후 
 
 ## `m3_manual_tick()`
 
-M3에 고정 100% gain과 M3 전용 속도·가속도를 적용한다. 현재 수동 한계와 엔드스톱 검사는 없다.
+M3에 고정 100% gain과 M3 전용 속도·가속도를 적용한다. 상한과 고정 하한 clamp는 사용하지 않으며 하한은 물리 엔드스톱 활성 상태로 판정한다.
+
+물리 엔드스톱이 활성화되면 접촉 위치를 저장하고 엔드스톱 방향 입력과 누적 모션을 정지한다. 센서가 순간 해제되어도 반대 방향으로 50 STEP 이상 복귀할 때까지 하한 latch를 유지한다. 새 활성 이벤트는 `M3 MIN ENDSTOP lower_steps=...` 형식으로 UART에 한 번 출력한다. `lower_steps`는 호밍 backoff 완료 원점 `0`에서 실제 엔드스톱까지 수동으로 이동한 STEP 좌표다.
+
+사용자가 조작 방향을 반대로 바꾸면 새 입력 방향과 반대인 기존 `target_pos` 큐를 현재 위치로 잘라내고 `accum_num`, `emit_accum`을 초기화한다. `vel`은 강제로 반전하지 않으므로 80000 SPS² 제한으로 감속한 뒤 새 방향으로 가속한다.
+
+M3가 움직이는 동안에는 `M3 POS current_steps=... target_steps=... lag_steps=...`을 1000 ms마다 출력한다. `lag_steps`는 목표와 현재 명령 위치의 차이이며 계속 커지면 모터 명령이 엔코더 입력을 따라가지 못하는 상태다. 위쪽에는 위치 센서가 없으므로 기계적 hard stop 접촉 순간의 `current_steps`를 작업자가 확인해야 한다. `current_pos`는 출력 STEP 기준이므로 접촉 후 계속 구동하면 실제 위치와 달라진다.
 
 ## `m45_manual_tick()`
 
-- coupled이면 M4/M5에 연속 속도를 명령한다.
-- 단독이면 선택된 모터에만 Encoder 4 delta를 전달한다.
-- M4/M5에는 현재 100% 또는 300% gain이 적용된다.
+- coupled이면 gain과 관계없이 M4 기준 800 SPS의 연속 속도를 명령한다.
+- coupled의 M5 속도는 M4 기준 속도에 ADC 비율을 곱한다.
+- 단독이면 선택된 모터에만 Encoder 4 delta와 현재 100% 또는 300% gain을 전달한다.
 
 # 10. `main()` 실행 단계
 
@@ -792,7 +806,7 @@ dt 계산
 -> m45_manual_tick()
 ```
 
-`dt`는 DWT cycle 차이를 `SystemCoreClock`으로 나눈 값이다. 제어 주기는 고정되어 있지 않고 STEP 처리량에 따라 달라진다. 수동 상태의 주기 UART 출력은 제거되어 있다.
+`dt`는 DWT cycle 차이를 `SystemCoreClock`으로 나눈 값이다. 제어 주기는 고정되어 있지 않고 STEP 처리량에 따라 달라진다. M1/M2/M4/M5의 수동 주기 UART 출력은 없으며 M3만 기계 한계 측정을 위해 움직이는 동안 1000 ms 위치 텔레메트리를 출력한다.
 
 ### Encoder 4 모드 변경 처리
 
@@ -854,7 +868,7 @@ DWT, STEP pulse, 버튼 debounce, 호밍 속도가 시스템 클록에 의존한
 - PA4/PA5 버튼 rising-edge EXTI, pulldown
 - PA6 모드 LED
 - PB12 gain LED fallback
-- PB14 M3 endstop fallback
+- PB14 M3 endstop fallback, pull-down input, HIGH active
 - PD2 M5 DIR
 
 # 12. 버튼 콜백과 오류 처리
@@ -903,25 +917,27 @@ Flow control: None
 현재 `uart_printf()`는 `HAL_UART_Transmit()` 기반 blocking 송신이다. 다음 원칙을 적용한다.
 
 - ISR과 모션 루프에서 긴 blocking 송신 금지
-- 수동 운전 중 주기 텔레메트리 출력 금지
-- M1/M2 limit 및 M3 물리 endstop 활성 이벤트만 1회 출력
+- M1/M2 수동 운전 중 주기 텔레메트리 출력 금지
+- M3 물리 MIN endstop 활성 이벤트는 1회 출력
+- M3 위치 측정 텔레메트리는 움직이는 동안 1000 ms 주기로 출력
 - limit 이벤트는 모션을 먼저 정지한 뒤 출력
 - 가능하면 DMA 또는 interrupt 기반 queue 사용
 
 # 14. 남은 작업
 
 1. M1/M2 호밍 후 최종 정지 위치 확정
-2. M3 엔드스톱 눌림 높이를 기준으로 하한 좌표 결정
-3. M3 상한 결정
-4. M3 속도와 가속도 조정
-5. 빠른 조작 시 목표 위치 누적량 측정
-6. 필요 시 UART 이벤트 출력을 interrupt 또는 DMA 기반 queue로 변경
+2. M3 수동 운전 중 물리 엔드스톱 접촉 위치 확인
+3. M3 위쪽 기계적 hard stop 접촉 STEP 확인
+4. M3 수동 가속도 80000 SPS² 실기 확인
+5. 급반전 시 이전 목표 큐 제거와 감속·반전 동작 확인
+6. M4/M5 동시모드가 gain과 관계없이 800 SPS를 유지하는지 확인
+7. 필요 시 UART 이벤트 출력을 interrupt 또는 DMA 기반 queue로 변경
 
 ## 실제 장비 조정 주의사항
 
 - 한 번에 한 파라미터 그룹만 변경한다.
 - 호밍 전류, 최대 거리, 최종 위치를 동시에 크게 바꾸지 않는다.
-- M3 하한 좌표 확정 전에는 엔드스톱 부근 고속 시험을 피한다.
+- M3 물리 하한 위치를 확인하기 전에는 엔드스톱 부근 고속 시험을 피한다.
 - 한계에서는 바깥 방향만 차단하고 반대 방향 복귀는 허용한다.
 - `current_pos`만으로 실제 stall 또는 step loss를 검출할 수 없다.
 - TMC2209 진단 read는 bit-bang 통신과 interrupt 차단 때문에 운전 중 모션을 방해할 수 있다.
