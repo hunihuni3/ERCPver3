@@ -78,14 +78,28 @@
 #define APP_MODE_INTEGRATED_CONTROL                  0u
 #define APP_MODE_M23_FEEDER                          1u
 #ifndef ACTIVE_APP_MODE
-#define ACTIVE_APP_MODE              APP_MODE_INTEGRATED_CONTROL
+#define ACTIVE_APP_MODE              APP_MODE_M23_FEEDER
 #endif
 
 /* ===== M2/M3 feeder drive ================================================ */
-#define M23_FEEDER_STAGE_COUNT                       7u
-#define M23_FEEDER_STAGE_MS                      10000u
-#define M2_FEEDER_DIRECTION                         (-1)
+/* The two EE-SX954-W white outputs connect directly to PB10 and PB13.
+ * Each output needs its own external 1 kOhm pull-up to the board's 3.3 V.
+ * Sensor wiring and clear/blocked transitions were verified before motion.
+ */
+#define M2_FEEDER_DIRECTION                         (1)
 #define M3_FEEDER_DIRECTION                         (-M2_FEEDER_DIRECTION)
+#define M23_SENSOR_BLOCKED_STATE             GPIO_PIN_RESET
+/* 1: UART sensor test only; no TMC initialization, homing, or motor motion. */
+#define M23_SENSOR_UART_TEST_ONLY                    0u
+#define M23_HOME_PASS_COUNT                          5u
+#define M23_HOME_SENSOR_FILTER_MS                    2u
+#define M23_HOME_RATE_SPS                           1200u
+/* Extra emitted STEP pulses after each axis's fifth BLOCKED -> CLEAR. */
+#define M2_HOME_EXTRA_STEPS                         3200u
+#define M3_HOME_EXTRA_STEPS                         3200u
+#define M23_MANUAL_MAX_RATE_SPS                    1700u
+#define M23_MANUAL_START_RATE_SPS                   200u
+#define M23_MANUAL_ACCEL_SPS2                      3000u
 
 /* ===== Manual-control values shared by all axes ========================== */
 #define MANUAL_FIXED_GAIN_PCT                       100
@@ -451,67 +465,320 @@ static uint8_t motor_driver_init(uint8_t mi)
 }
 
 #if ACTIVE_APP_MODE == APP_MODE_M23_FEEDER
-static inline void m23_feeder_step_pulse(Motor *m2, Motor *m3)
+/* Dedicated inputs: PB10 for M2, PB13 for M3. */
+static void m23_feeder_sensor_init(void)
 {
-    if (m2->step_port == m3->step_port) {
-        uint16_t step_pins = (uint16_t)(m2->step_pin | m3->step_pin);
+    GPIO_InitTypeDef gpio = {0};
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_NOPULL; /* External 1 kOhm pull-ups to 3.3 V. */
+    gpio.Pin = GPIO_PIN_10 | GPIO_PIN_13;
+    HAL_GPIO_Init(GPIOB, &gpio);
+}
 
-        HAL_GPIO_WritePin(m2->step_port, step_pins, GPIO_PIN_SET);
-        dwt_delay_cycles(STEP_PULSE_CYCLES);
-        HAL_GPIO_WritePin(m2->step_port, step_pins, GPIO_PIN_RESET);
-        dwt_delay_cycles(STEP_PULSE_CYCLES);
-        return;
+static uint8_t m23_m2_blocked(void)
+{
+    return HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10) == M23_SENSOR_BLOCKED_STATE;
+}
+
+static uint8_t m23_m3_blocked(void)
+{
+    return HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13) == M23_SENSOR_BLOCKED_STATE;
+}
+
+#if M23_SENSOR_UART_TEST_ONLY
+/* Print both raw MCU inputs on any change and once per second. */
+static void m23_sensor_uart_test_run(void)
+{
+    GPIO_PinState last1 = (GPIO_PinState)2;
+    GPIO_PinState last2 = (GPIO_PinState)2;
+    uint32_t last_report = HAL_GetTick() - 1000u;
+
+    uart_printf("SENSOR TEST ONLY: PB10=M2 PB13=M3; motors disabled\r\n");
+    while (1) {
+        GPIO_PinState a1 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10);
+        GPIO_PinState a2 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
+        uint32_t now = HAL_GetTick();
+        if (a1 != last1 || a2 != last2 ||
+            (uint32_t)(now - last_report) >= 1000u) {
+            uart_printf("PB10 M2=%u %s | PB13 M3=%u %s\r\n",
+                        (unsigned)a1,
+                        a1 == M23_SENSOR_BLOCKED_STATE ? "BLOCKED" : "CLEAR",
+                        (unsigned)a2,
+                        a2 == M23_SENSOR_BLOCKED_STATE ? "BLOCKED" : "CLEAR");
+            last1 = a1;
+            last2 = a2;
+            last_report = now;
+        }
+        HAL_Delay(20u);
     }
+}
+#endif
 
-    HAL_GPIO_WritePin(m2->step_port, m2->step_pin, GPIO_PIN_SET);
-    HAL_GPIO_WritePin(m3->step_port, m3->step_pin, GPIO_PIN_SET);
+static void m23_feeder_set_direction(int32_t sign)
+{
+    Motor *m2 = &mot[MOTOR_M2_INDEX];
+    Motor *m3 = &mot[MOTOR_M3_INDEX];
+    HAL_GPIO_WritePin(m2->dir_port, m2->dir_pin,
+                      (sign * M2_FEEDER_DIRECTION > 0) ?
+                      GPIO_PIN_SET : GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(m3->dir_port, m3->dir_pin,
+                      (sign * M3_FEEDER_DIRECTION > 0) ?
+                      GPIO_PIN_SET : GPIO_PIN_RESET);
+    dwt_delay_cycles(SystemCoreClock / 100000u); /* 10 us DIR setup */
+}
+
+static inline void m23_feeder_step_pulse(uint8_t step_m2, uint8_t step_m3)
+{
+    Motor *m2 = &mot[MOTOR_M2_INDEX];
+    Motor *m3 = &mot[MOTOR_M3_INDEX];
+    if (step_m2)
+        HAL_GPIO_WritePin(m2->step_port, m2->step_pin, GPIO_PIN_SET);
+    if (step_m3)
+        HAL_GPIO_WritePin(m3->step_port, m3->step_pin, GPIO_PIN_SET);
     dwt_delay_cycles(STEP_PULSE_CYCLES);
-    HAL_GPIO_WritePin(m2->step_port, m2->step_pin, GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(m3->step_port, m3->step_pin, GPIO_PIN_RESET);
+    if (step_m2)
+        HAL_GPIO_WritePin(m2->step_port, m2->step_pin, GPIO_PIN_RESET);
+    if (step_m3)
+        HAL_GPIO_WritePin(m3->step_port, m3->step_pin, GPIO_PIN_RESET);
     dwt_delay_cycles(STEP_PULSE_CYCLES);
 }
 
-static void m23_feeder_run(void)
-{
-    static const uint32_t stage_speed_sps[M23_FEEDER_STAGE_COUNT] = {
-        1200u, 1200u, 1700u, 1700u, 1200u, 1200u, 1700u
-    };
-    Motor *m2 = &mot[MOTOR_M2_INDEX];
-    Motor *m3 = &mot[MOTOR_M3_INDEX];
+typedef struct {
+    uint8_t stable_blocked;
+    uint8_t candidate_blocked;
+    uint8_t seen_block;
+    uint32_t candidate_since_ms;
+    uint32_t passes;
+} M23HomeSensor;
 
-    HAL_GPIO_WritePin(m2->dir_port, m2->dir_pin,
-                      (M2_FEEDER_DIRECTION > 0) ?
-                      GPIO_PIN_SET : GPIO_PIN_RESET);
-    HAL_GPIO_WritePin(m3->dir_port, m3->dir_pin,
-                      (M3_FEEDER_DIRECTION > 0) ?
-                      GPIO_PIN_SET : GPIO_PIN_RESET);
-    dwt_delay_cycles(SystemCoreClock / 100000u);
+static void m23_home_sensor_reset(M23HomeSensor *sensor,
+                                  uint8_t blocked, uint32_t now_ms)
+{
+    sensor->stable_blocked = blocked;
+    sensor->candidate_blocked = blocked;
+    sensor->candidate_since_ms = now_ms;
+    sensor->seen_block = 0u;
+    sensor->passes = 0u;
+}
+
+/* Count one stable BLOCKED -> CLEAR pair, not repeated samples.
+ * An initial blocked state is partial: its first release is not counted.
+ */
+static uint8_t m23_home_sensor_update(M23HomeSensor *sensor,
+                                     uint8_t blocked, uint32_t now_ms)
+{
+    if (blocked != sensor->candidate_blocked) {
+        sensor->candidate_blocked = blocked;
+        sensor->candidate_since_ms = now_ms;
+    }
+    if (sensor->candidate_blocked == sensor->stable_blocked ||
+        (uint32_t)(now_ms - sensor->candidate_since_ms) <
+            M23_HOME_SENSOR_FILTER_MS)
+        return 0u;
+
+    sensor->stable_blocked = sensor->candidate_blocked;
+    if (sensor->stable_blocked) {
+        sensor->seen_block = 1u;
+        return 0u;
+    }
+    if (sensor->seen_block) {
+        sensor->seen_block = 0u;
+        sensor->passes++;
+        return 1u;
+    }
+    return 0u;
+}
+
+typedef struct {
+    M23HomeSensor sensor;
+    uint32_t extra_steps_remaining;
+    uint8_t finishing;
+    uint8_t done;
+} M23HomeAxis;
+
+static void m23_home_axis_reset(M23HomeAxis *axis,
+                                uint8_t blocked, uint32_t now_ms)
+{
+    m23_home_sensor_reset(&axis->sensor, blocked, now_ms);
+    axis->extra_steps_remaining = 0u;
+    axis->finishing = 0u;
+    axis->done = 0u;
+}
+
+static uint8_t m23_home_axis_update(M23HomeAxis *axis, uint8_t blocked,
+                                    uint32_t now_ms, uint32_t extra_steps)
+{
+    if (axis->finishing || axis->done)
+        return 0u;
+    uint8_t pass = m23_home_sensor_update(&axis->sensor, blocked, now_ms);
+    if (pass && axis->sensor.passes >= M23_HOME_PASS_COUNT) {
+        axis->finishing = 1u;
+        axis->extra_steps_remaining = extra_steps;
+        axis->done = extra_steps == 0u;
+    }
+    return pass;
+}
+
+/* Called only after this axis actually emitted a STEP pulse. */
+static void m23_home_axis_step_completed(M23HomeAxis *axis)
+{
+    if (axis->finishing && !axis->done) {
+        axis->extra_steps_remaining--;
+        if (axis->extra_steps_remaining == 0u)
+            axis->done = 1u;
+    }
+}
+
+/* No seek travel limit: each axis seeks five passes, then its extra steps. */
+static uint8_t m23_feeder_home(void)
+{
+    M23HomeAxis m2_axis, m3_axis;
+    uint32_t start_ms = HAL_GetTick();
+    m23_home_axis_reset(&m2_axis, m23_m2_blocked(), start_ms);
+    m23_home_axis_reset(&m3_axis, m23_m3_blocked(), start_ms);
+
+    uart_printf("HOME START: target=%lu rate=%lu extra M2=%lu M3=%lu; no travel limit\r\n",
+                (unsigned long)M23_HOME_PASS_COUNT,
+                (unsigned long)M23_HOME_RATE_SPS,
+                (unsigned long)M2_HOME_EXTRA_STEPS,
+                (unsigned long)M3_HOME_EXTRA_STEPS);
+    uart_printf("HOME INITIAL: M2=%s M3=%s; initial block not counted\r\n",
+                m2_axis.sensor.stable_blocked ? "BLOCKED" : "CLEAR",
+                m3_axis.sensor.stable_blocked ? "BLOCKED" : "CLEAR");
+    uint32_t last_cyc = DWT->CYCCNT;
+    const uint32_t period = SystemCoreClock / M23_HOME_RATE_SPS;
+    m23_feeder_set_direction(+1);
+
+    while (!m2_axis.done || !m3_axis.done) {
+        uint32_t now_ms = HAL_GetTick();
+        uint8_t m2_pass = m23_home_axis_update(&m2_axis,
+            m23_m2_blocked(), now_ms, M2_HOME_EXTRA_STEPS);
+        uint8_t m3_pass = m23_home_axis_update(&m3_axis,
+            m23_m3_blocked(), now_ms, M3_HOME_EXTRA_STEPS);
+        if (m2_pass) {
+            uart_printf("M2 HOME PASS %lu/%lu\r\n",
+                        (unsigned long)m2_axis.sensor.passes,
+                        (unsigned long)M23_HOME_PASS_COUNT);
+            if (m2_axis.finishing)
+                uart_printf("M2 EXTRA START: %lu steps%s\r\n",
+                            (unsigned long)M2_HOME_EXTRA_STEPS,
+                            m2_axis.done ? " STOP" : "");
+        }
+        if (m3_pass) {
+            uart_printf("M3 HOME PASS %lu/%lu\r\n",
+                        (unsigned long)m3_axis.sensor.passes,
+                        (unsigned long)M23_HOME_PASS_COUNT);
+            if (m3_axis.finishing)
+                uart_printf("M3 EXTRA START: %lu steps%s\r\n",
+                            (unsigned long)M3_HOME_EXTRA_STEPS,
+                            m3_axis.done ? " STOP" : "");
+        }
+        if (m2_axis.done && m3_axis.done)
+            break;
+
+        uint32_t now = DWT->CYCCNT;
+        if ((uint32_t)(now - last_cyc) < period)
+            continue;
+        last_cyc = now;
+        uint8_t step_m2 = !m2_axis.done, step_m3 = !m3_axis.done;
+        m23_feeder_step_pulse(step_m2, step_m3);
+        if (step_m2) {
+            m23_home_axis_step_completed(&m2_axis);
+            if (m2_axis.done)
+                uart_printf("M2 EXTRA COMPLETE: STOP\r\n");
+        }
+        if (step_m3) {
+            m23_home_axis_step_completed(&m3_axis);
+            if (m3_axis.done)
+                uart_printf("M3 EXTRA COMPLETE: STOP\r\n");
+        }
+    }
+    mot[MOTOR_M2_INDEX].target_pos = mot[MOTOR_M2_INDEX].current_pos = 0;
+    mot[MOTOR_M3_INDEX].target_pos = mot[MOTOR_M3_INDEX].current_pos = 0;
+    uart_printf("HOME COMPLETE: five passes + extra steps; origins reset\r\n");
+    return 1u;
+}
+
+typedef struct {
+    int64_t pending_steps;
+    int64_t remainder;
+    int32_t input_direction;
+} M23ManualCommand;
+
+/* Any encoder input reversal discards the old queue and fraction first. */
+static uint8_t m23_manual_input_update(M23ManualCommand *command, int32_t delta)
+{
+    if (delta == 0)
+        return 0u;
+    int32_t direction = delta > 0 ? +1 : -1;
+    uint8_t reversed = command->input_direction != 0 &&
+                       direction != command->input_direction;
+    if (reversed) {
+        command->pending_steps = 0;
+        command->remainder = 0;
+    }
+    command->input_direction = direction;
+    command->remainder += (int64_t)delta * INPUT_COUNT_TO_MICROSTEP_NUM;
+    int64_t steps = command->remainder / INPUT_COUNT_TO_MICROSTEP_DEN;
+    command->remainder -= steps * INPUT_COUNT_TO_MICROSTEP_DEN;
+    command->pending_steps += steps;
+    return reversed;
+}
+
+/* ENC4 moves both rollers; a relative 64-bit queue has no position clamp. */
+static void m23_feeder_manual_run(void)
+{
+    InEnc *enc4 = &in_enc[INPUT_ENCODER_M45_INDEX];
+    M23ManualCommand command = {0};
+    uint32_t last_cyc = DWT->CYCCNT;
+    uint32_t speed = M23_MANUAL_START_RATE_SPS;
+    int32_t last_dir = 0;
+
+    __HAL_TIM_SET_COUNTER(enc4->tim, 0u);
+    enc4->prev = 0u;
+    if (HAL_TIM_Encoder_Start(enc4->tim, TIM_CHANNEL_ALL) != HAL_OK)
+        return;
+    uart_printf("FEEDER READY: ENC4; no travel limit; reversal clears queue\r\n");
 
     while (1) {
-        for (uint32_t stage = 0u; stage < M23_FEEDER_STAGE_COUNT;
-             stage++) {
-            uint32_t speed_sps = stage_speed_sps[stage];
-            uint32_t step_period_cycles = SystemCoreClock / speed_sps;
-            uint32_t stage_start_ms = HAL_GetTick();
-            uint32_t last_step_cyc = DWT->CYCCNT;
-
-            uart_printf("M2/M3 FEEDER STAGE %lu/%lu: %lu SPS, %lu ms, "
-                        "OPPOSITE DIR\r\n",
-                        (unsigned long)(stage + 1u),
-                        (unsigned long)M23_FEEDER_STAGE_COUNT,
-                        (unsigned long)speed_sps,
-                        (unsigned long)M23_FEEDER_STAGE_MS);
-
-            while ((uint32_t)(HAL_GetTick() - stage_start_ms) <
-                   M23_FEEDER_STAGE_MS) {
-                uint32_t now_cyc = DWT->CYCCNT;
-                if ((uint32_t)(now_cyc - last_step_cyc) >=
-                    step_period_cycles) {
-                    last_step_cyc = now_cyc;
-                    m23_feeder_step_pulse(m2, m3);
-                }
-            }
+        int32_t delta = in_enc_delta(enc4);
+        if (m23_manual_input_update(&command, delta)) {
+            /* Cancel old motion before another pulse, including sub-step input. */
+            m23_feeder_set_direction(command.input_direction);
+            last_dir = command.input_direction;
+            speed = M23_MANUAL_START_RATE_SPS;
+            last_cyc = DWT->CYCCNT;
         }
+        if (command.pending_steps == 0) {
+            speed = M23_MANUAL_START_RATE_SPS;
+            last_dir = 0;
+            last_cyc = DWT->CYCCNT;
+            continue;
+        }
+
+        int32_t dir = command.pending_steps > 0 ? +1 : -1;
+        if (dir != last_dir) {
+            m23_feeder_set_direction(dir);
+            speed = M23_MANUAL_START_RATE_SPS;
+            last_dir = dir;
+            last_cyc = DWT->CYCCNT;
+        }
+        uint32_t now = DWT->CYCCNT;
+        if ((uint32_t)(now - last_cyc) < SystemCoreClock / speed)
+            continue;
+        last_cyc = now;
+        m23_feeder_step_pulse(1u, 1u);
+        command.pending_steps -= dir;
+
+        int64_t remaining = command.pending_steps > 0 ?
+                            command.pending_steps : -command.pending_steps;
+        float braking = sqrtf(2.0f * (float)M23_MANUAL_ACCEL_SPS2 * (float)remaining);
+        uint32_t ramp = speed + M23_MANUAL_ACCEL_SPS2 / speed;
+        if (ramp > M23_MANUAL_MAX_RATE_SPS) ramp = M23_MANUAL_MAX_RATE_SPS;
+        if (braking < (float)ramp) ramp = (uint32_t)braking;
+        if (ramp < M23_MANUAL_START_RATE_SPS)
+            ramp = M23_MANUAL_START_RATE_SPS;
+        speed = ramp;
     }
 }
 #endif
@@ -1569,9 +1836,17 @@ int main(void)
 
   dwt_delay_init();
 #if ACTIVE_APP_MODE == APP_MODE_M23_FEEDER
-  uart_printf("BOOT: M2/M3 FEEDER DRIVE\r\n");
+#if M23_SENSOR_UART_TEST_ONLY
+  uart_printf("BOOT: PB10/PB13 SENSOR TEST, MOTORS DISABLED\r\n");
+#else
+  uart_printf("BOOT: M2/M3 FIVE-PASS + EXTRA HOME; ENC4 REVERSE CANCEL\r\n");
+#endif
+  m23_feeder_sensor_init();
 
-  HAL_Delay(100u);
+  HAL_Delay(100u); /* EE-SX95 power-on stabilization. */
+#if M23_SENSOR_UART_TEST_ONLY
+  m23_sensor_uart_test_run(); /* Intentionally never enables the motors. */
+#endif
   tmc_write_nodeconf(mot[MOTOR_M2_INDEX].pdn_port,
                      mot[MOTOR_M2_INDEX].pdn_pin,
                      mot[MOTOR_M2_INDEX].tmc_addr, 2);
@@ -1593,8 +1868,21 @@ int main(void)
     Error_Handler();
   }
 
-  uart_printf("M2/M3 DRIVERS OK: FEEDER START\r\n");
-  m23_feeder_run();
+  uart_printf("M2/M3 DRIVERS OK: optical homing start\r\n");
+  if (!m23_feeder_home()) {
+    HAL_GPIO_WritePin(mot[MOTOR_M2_INDEX].en_port,
+                      mot[MOTOR_M2_INDEX].en_pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(mot[MOTOR_M3_INDEX].en_port,
+                      mot[MOTOR_M3_INDEX].en_pin, GPIO_PIN_SET);
+    uart_printf("HOME ERROR: incomplete five-pass homing; M2/M3 disabled\r\n");
+    Error_Handler();
+  }
+  m23_feeder_manual_run();
+  HAL_GPIO_WritePin(mot[MOTOR_M2_INDEX].en_port,
+                    mot[MOTOR_M2_INDEX].en_pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(mot[MOTOR_M3_INDEX].en_port,
+                    mot[MOTOR_M3_INDEX].en_pin, GPIO_PIN_SET);
+  Error_Handler();
 #endif
 
   uart_printf("BOOT: M1 M2 M3 M4 M5 CONTROL\r\n");
