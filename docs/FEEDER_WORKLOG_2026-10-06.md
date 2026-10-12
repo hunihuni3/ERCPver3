@@ -1,5 +1,11 @@
 # 피더 광센서 호밍 작업 기록 — 2026-10-06
 
+## 2026-10-12 갱신: 전류 700 mA
+
+사용자의 "전류 700으로 다 바꾼 버전" 요청으로 `M1_RUN_CURRENT_MA`~`M5_RUN_CURRENT_MA` 및 통합 모드의 `HOME_M1_TOUCH_CURRENT_MA`, `HOME_M2_TOUCH_CURRENT_MA`를 모두 700으로 변경했다. 피더 모드의 M2/M3 호밍과 ENC4 수동 제어도 이 운전 전류를 사용한다. 아래 2026-10-06의 1000/800 mA 표기는 당시 저장값이며 현재 값은 700 mA이다. 속도·방향·통과 횟수·추가 이동량 설정은 유지한다. TMC 드라이버의 기존 hold/run 비율 및 전류 코드 변환은 유지한다.
+
+검증: CubeIDE의 make 실행이 격리 환경의 Windows DLL 재할당 오류로 실패하여, ARM GCC 13.3으로 변경된 main.c를 직접 컴파일하고 기존의 동일한 HAL/기동 오브젝트들과 링크했다. 컴파일·링크 오류/경고 없이 ELF 생성 확인(text 36428, data 516, bss 2588 bytes). 실제 장비에서 700 mA 구동은 별도 확인이 필요하다.
+
 ## 저장 기준
 
 - 저장소: https://github.com/hunihuni3/ERCPver3

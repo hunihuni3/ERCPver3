@@ -68,11 +68,11 @@
 #define UART_BAUD_RATE                          115200u
 #define UART_TX_TIMEOUT_MS                          30u
 
-#define M1_RUN_CURRENT_MA                         1000u
-#define M2_RUN_CURRENT_MA                         1000u
-#define M3_RUN_CURRENT_MA                          800u
-#define M4_RUN_CURRENT_MA                         1000u
-#define M5_RUN_CURRENT_MA                         1000u
+#define M1_RUN_CURRENT_MA                          700u
+#define M2_RUN_CURRENT_MA                          700u
+#define M3_RUN_CURRENT_MA                          700u
+#define M4_RUN_CURRENT_MA                          700u
+#define M5_RUN_CURRENT_MA                          700u
 
 /* ===== Application mode selection ======================================== */
 #define APP_MODE_INTEGRATED_CONTROL                  0u
@@ -869,8 +869,8 @@ static void reset_m4_m5_motion_state(void)
 
 
 /* Encoder homing for M1/M2. Values come from the latest verified M2/M3 code. */
-#define HOME_M1_TOUCH_CURRENT_MA     175u
-#define HOME_M2_TOUCH_CURRENT_MA     300u
+#define HOME_M1_TOUCH_CURRENT_MA     700u
+#define HOME_M2_TOUCH_CURRENT_MA     700u
 #define HOME_APPROACH_V              800u
 #define HOME_RETURN_V                800u
 #define HOME_WIN                      16u
