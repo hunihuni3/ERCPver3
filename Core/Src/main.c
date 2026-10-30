@@ -78,7 +78,7 @@
 #define APP_MODE_INTEGRATED_CONTROL                  0u
 #define APP_MODE_M23_FEEDER                          1u
 #ifndef ACTIVE_APP_MODE
-#define ACTIVE_APP_MODE              APP_MODE_M23_FEEDER
+#define ACTIVE_APP_MODE              APP_MODE_INTEGRATED_CONTROL
 #endif
 
 /* ===== M2/M3 feeder drive ================================================ */
@@ -100,6 +100,32 @@
 #define M23_MANUAL_MAX_RATE_SPS                    1700u
 #define M23_MANUAL_START_RATE_SPS                   200u
 #define M23_MANUAL_ACCEL_SPS2                      3000u
+
+/* ===== M2/M3 feeder foot pedal (HERGA 6226-0003) ========================= */
+/* Two momentary normally-open contacts on a 3-core cable:
+ *   green = common     -> GND
+ *   blue  = left pedal -> PA10 (PCB TP8)  = feeder REVERSE
+ *   red   = right pedal-> PB15 (PCB TP11) = feeder FORWARD
+ * Inputs are pulled up: released = HIGH, pressed = LOW. A broken wire reads
+ * as "released", so a wiring fault stops the feeder instead of moving it.
+ * The internal pull-up is weak (~40 kOhm); add an external 4.7 kOhm to 3.3 V
+ * on each input for the 2 m cable.
+ * Hold = move with the same ramp as ENC4 (start/max/accel above).
+ * Release or both pressed = stop. ENC4 still works while no pedal is held.
+ * Arming: a pedal already held when manual control starts (after homing),
+ * or both pedals pressed together, keeps the feeder stopped until both
+ * pedals are released. Lifting a foot therefore never starts motion. */
+#define FOOT_PEDAL_ENABLE                            1u
+#define FOOT_LEFT_PORT                           GPIOA
+#define FOOT_LEFT_PIN                      GPIO_PIN_10
+#define FOOT_RIGHT_PORT                          GPIOB
+#define FOOT_RIGHT_PIN                     GPIO_PIN_15
+#define FOOT_PRESSED_STATE              GPIO_PIN_RESET
+#define FOOT_DEBOUNCE_MS                            20u
+/* Feeder sign driven by the right pedal. Flip to (-1) if it retracts. */
+#define FOOT_FORWARD_FEEDER_SIGN                     (1)
+/* 1: stop at the next step after release. 0: decelerate with M23_MANUAL_ACCEL_SPS2. */
+#define FOOT_RELEASE_STOP_IMMEDIATE                  1u
 
 /* ===== Manual-control values shared by all axes ========================== */
 #define MANUAL_FIXED_GAIN_PCT                       100
@@ -493,18 +519,40 @@ static void m23_sensor_uart_test_run(void)
     GPIO_PinState last2 = (GPIO_PinState)2;
     uint32_t last_report = HAL_GetTick() - 1000u;
 
+#if FOOT_PEDAL_ENABLE
+    GPIO_PinState last_l = (GPIO_PinState)2;
+    GPIO_PinState last_r = (GPIO_PinState)2;
+#endif
+
     uart_printf("SENSOR TEST ONLY: PB10=M2 PB13=M3; motors disabled\r\n");
     while (1) {
         GPIO_PinState a1 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10);
         GPIO_PinState a2 = HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_13);
         uint32_t now = HAL_GetTick();
-        if (a1 != last1 || a2 != last2 ||
+#if FOOT_PEDAL_ENABLE
+        GPIO_PinState pl = HAL_GPIO_ReadPin(FOOT_LEFT_PORT, FOOT_LEFT_PIN);
+        GPIO_PinState pr = HAL_GPIO_ReadPin(FOOT_RIGHT_PORT, FOOT_RIGHT_PIN);
+        uint8_t pedal_changed = pl != last_l || pr != last_r;
+#else
+        uint8_t pedal_changed = 0u;
+#endif
+        if (a1 != last1 || a2 != last2 || pedal_changed ||
             (uint32_t)(now - last_report) >= 1000u) {
-            uart_printf("PB10 M2=%u %s | PB13 M3=%u %s\r\n",
+            uart_printf("PB10 M2=%u %s | PB13 M3=%u %s",
                         (unsigned)a1,
                         a1 == M23_SENSOR_BLOCKED_STATE ? "BLOCKED" : "CLEAR",
                         (unsigned)a2,
                         a2 == M23_SENSOR_BLOCKED_STATE ? "BLOCKED" : "CLEAR");
+#if FOOT_PEDAL_ENABLE
+            uart_printf(" | PA10 L=%u %s | PB15 R=%u %s",
+                        (unsigned)pl,
+                        pl == FOOT_PRESSED_STATE ? "PRESSED" : "UP",
+                        (unsigned)pr,
+                        pr == FOOT_PRESSED_STATE ? "PRESSED" : "UP");
+            last_l = pl;
+            last_r = pr;
+#endif
+            uart_printf("\r\n");
             last1 = a1;
             last2 = a2;
             last_report = now;
@@ -542,6 +590,117 @@ static inline void m23_feeder_step_pulse(uint8_t step_m2, uint8_t step_m3)
         HAL_GPIO_WritePin(m3->step_port, m3->step_pin, GPIO_PIN_RESET);
     dwt_delay_cycles(STEP_PULSE_CYCLES);
 }
+
+#if FOOT_PEDAL_ENABLE
+typedef struct {
+    GPIO_TypeDef *port;
+    uint16_t pin;
+    uint8_t stable_pressed;    /* debounced state used by the controller */
+    uint8_t candidate_pressed; /* raw state waiting to be confirmed */
+    uint32_t candidate_since_ms;
+} FootPedal;
+
+static FootPedal foot_left  = { FOOT_LEFT_PORT,  FOOT_LEFT_PIN,  0u, 0u, 0u };
+static FootPedal foot_right = { FOOT_RIGHT_PORT, FOOT_RIGHT_PIN, 0u, 0u, 0u };
+
+static uint8_t foot_pedal_raw_pressed(const FootPedal *p)
+{
+    return HAL_GPIO_ReadPin(p->port, p->pin) == FOOT_PRESSED_STATE;
+}
+
+/* Pins are set up here, not in the .ioc, so CubeMX regeneration keeps them. */
+static void foot_pedal_init(void)
+{
+    GPIO_InitTypeDef gpio = {0};
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    gpio.Mode = GPIO_MODE_INPUT;
+    gpio.Pull = GPIO_PULLUP;
+    gpio.Speed = GPIO_SPEED_FREQ_LOW;
+    gpio.Pin = FOOT_LEFT_PIN;
+    HAL_GPIO_Init(FOOT_LEFT_PORT, &gpio);
+    gpio.Pin = FOOT_RIGHT_PIN;
+    HAL_GPIO_Init(FOOT_RIGHT_PORT, &gpio);
+
+    HAL_Delay(2u); /* let the pull-ups charge the cable */
+}
+
+/* Take the current pedal levels as the debounced state. Called when manual
+ * control starts, so a pedal held during homing is seen as held. */
+static void foot_pedal_resync(void)
+{
+    uint32_t now = HAL_GetTick();
+    FootPedal *pedals[2] = { &foot_left, &foot_right };
+    for (int i = 0; i < 2; i++) {
+        uint8_t raw = foot_pedal_raw_pressed(pedals[i]);
+        pedals[i]->stable_pressed = raw;
+        pedals[i]->candidate_pressed = raw;
+        pedals[i]->candidate_since_ms = now;
+    }
+}
+
+/* A new level must hold for FOOT_DEBOUNCE_MS. Returns 1 when stable changes. */
+static uint8_t foot_pedal_update(FootPedal *p, uint32_t now_ms)
+{
+    uint8_t raw = foot_pedal_raw_pressed(p);
+    if (raw != p->candidate_pressed) {
+        p->candidate_pressed = raw;
+        p->candidate_since_ms = now_ms;
+        return 0u;
+    }
+    if (raw != p->stable_pressed &&
+        (uint32_t)(now_ms - p->candidate_since_ms) >= FOOT_DEBOUNCE_MS) {
+        p->stable_pressed = raw;
+        return 1u;
+    }
+    return 0u;
+}
+
+/* +1 = forward (right only), -1 = reverse (left only), 0 = none or both. */
+static int32_t foot_pedal_command(void)
+{
+    if (foot_left.stable_pressed == foot_right.stable_pressed)
+        return 0;
+    return foot_right.stable_pressed ? +1 : -1;
+}
+
+/* Arming rule: motion is accepted only after both pedals have been seen
+ * released. Pressing both disarms, so lifting one foot never starts motion. */
+static void foot_pedal_update_arming(uint8_t *armed)
+{
+    uint8_t both = foot_left.stable_pressed && foot_right.stable_pressed;
+    uint8_t none = !foot_left.stable_pressed && !foot_right.stable_pressed;
+    if (*armed && both) {
+        *armed = 0u;
+        uart_printf("PEDAL BOTH: STOP; release both to re-arm\r\n");
+    } else if (!*armed && none) {
+        *armed = 1u;
+        uart_printf("PEDAL ARMED\r\n");
+    }
+}
+
+/* One 1 ms sample: debounce both pedals, update arming, return the command
+ * (-1 reverse, 0 stop, +1 forward). Logs only when the command changes. */
+static int32_t foot_pedal_poll(uint32_t now_ms, uint8_t *armed, int32_t prev_cmd)
+{
+    uint8_t changed = foot_pedal_update(&foot_left, now_ms);
+    changed |= foot_pedal_update(&foot_right, now_ms);
+    if (!changed)
+        return prev_cmd;
+
+    foot_pedal_update_arming(armed);
+    int32_t cmd = *armed ? foot_pedal_command() : 0;
+    if (cmd != prev_cmd) {
+        if (cmd > 0)
+            uart_printf("PEDAL R: FORWARD\r\n");
+        else if (cmd < 0)
+            uart_printf("PEDAL L: REVERSE\r\n");
+        else if (*armed)
+            uart_printf("PEDAL RELEASED: STOP\r\n");
+    }
+    return cmd;
+}
+#endif
 
 typedef struct {
     uint8_t stable_blocked;
@@ -725,7 +884,9 @@ static uint8_t m23_manual_input_update(M23ManualCommand *command, int32_t delta)
     return reversed;
 }
 
-/* ENC4 moves both rollers; a relative 64-bit queue has no position clamp. */
+/* ENC4 moves both rollers; a relative 64-bit queue has no position clamp.
+ * A held foot pedal overrides ENC4: it drops the ENC4 queue and runs a
+ * hold-to-move speed command until release. */
 static void m23_feeder_manual_run(void)
 {
     InEnc *enc4 = &in_enc[INPUT_ENCODER_M45_INDEX];
@@ -733,14 +894,87 @@ static void m23_feeder_manual_run(void)
     uint32_t last_cyc = DWT->CYCCNT;
     uint32_t speed = M23_MANUAL_START_RATE_SPS;
     int32_t last_dir = 0;
+#if FOOT_PEDAL_ENABLE
+    int32_t pedal_cmd = 0;    /* debounced pedal command: -1, 0, +1 */
+    int32_t pedal_dir = 0;    /* feeder sign the pedal is driving, 0 = idle */
+    uint8_t pedal_armed = 0u;
+    uint32_t last_poll_ms = 0u;
+#endif
 
     __HAL_TIM_SET_COUNTER(enc4->tim, 0u);
     enc4->prev = 0u;
     if (HAL_TIM_Encoder_Start(enc4->tim, TIM_CHANNEL_ALL) != HAL_OK)
         return;
+#if FOOT_PEDAL_ENABLE
+    /* Sample the pedals now, after homing: one held at this moment must be
+     * released before it can move the feeder. */
+    foot_pedal_resync();
+    pedal_armed = !foot_left.stable_pressed && !foot_right.stable_pressed;
+    last_poll_ms = HAL_GetTick();
+    uart_printf("FEEDER READY: ENC4 + PEDAL (L=PA10 REVERSE, R=PB15 FORWARD)\r\n");
+    if (!pedal_armed)
+        uart_printf("PEDAL HELD AT START: release both pedals to arm\r\n");
+#else
     uart_printf("FEEDER READY: ENC4; no travel limit; reversal clears queue\r\n");
+#endif
 
     while (1) {
+#if FOOT_PEDAL_ENABLE
+        /* Sample the pedals once per millisecond tick. */
+        uint32_t now_ms = HAL_GetTick();
+        if (now_ms != last_poll_ms) {
+            last_poll_ms = now_ms;
+            pedal_cmd = foot_pedal_poll(now_ms, &pedal_armed, pedal_cmd);
+        }
+
+        if (pedal_cmd != 0) {
+            int32_t dir = pedal_cmd * FOOT_FORWARD_FEEDER_SIGN;
+            /* The pedal owns the feeder: discard ENC4 input and its queue. */
+            (void)in_enc_delta(enc4);
+            command.pending_steps = 0;
+            command.remainder = 0;
+            command.input_direction = 0;
+            if (dir != last_dir) {
+                m23_feeder_set_direction(dir);
+                speed = M23_MANUAL_START_RATE_SPS;
+                last_dir = dir;
+                last_cyc = DWT->CYCCNT;
+            }
+            pedal_dir = dir;
+
+            uint32_t now = DWT->CYCCNT;
+            if ((uint32_t)(now - last_cyc) < SystemCoreClock / speed)
+                continue;
+            last_cyc = now;
+            m23_feeder_step_pulse(1u, 1u);
+            uint32_t ramp = speed + M23_MANUAL_ACCEL_SPS2 / speed;
+            speed = ramp > M23_MANUAL_MAX_RATE_SPS ? M23_MANUAL_MAX_RATE_SPS : ramp;
+            continue;
+        }
+
+        if (pedal_dir != 0) {
+            /* Pedal released (or both pressed): stop before ENC4 resumes. */
+            (void)in_enc_delta(enc4);
+#if !FOOT_RELEASE_STOP_IMMEDIATE
+            if (speed > M23_MANUAL_START_RATE_SPS) {
+                uint32_t now = DWT->CYCCNT;
+                if ((uint32_t)(now - last_cyc) < SystemCoreClock / speed)
+                    continue;
+                last_cyc = now;
+                m23_feeder_step_pulse(1u, 1u);
+                uint32_t dec = M23_MANUAL_ACCEL_SPS2 / speed;
+                speed = speed > M23_MANUAL_START_RATE_SPS + dec ?
+                        speed - dec : M23_MANUAL_START_RATE_SPS;
+                continue;
+            }
+#endif
+            pedal_dir = 0;
+            speed = M23_MANUAL_START_RATE_SPS;
+            last_dir = 0;
+            last_cyc = DWT->CYCCNT;
+            continue;
+        }
+#endif
         int32_t delta = in_enc_delta(enc4);
         if (m23_manual_input_update(&command, delta)) {
             /* Cancel old motion before another pulse, including sub-step input. */
@@ -1842,6 +2076,9 @@ int main(void)
   uart_printf("BOOT: M2/M3 FIVE-PASS + EXTRA HOME; ENC4 REVERSE CANCEL\r\n");
 #endif
   m23_feeder_sensor_init();
+#if FOOT_PEDAL_ENABLE
+  foot_pedal_init(); /* pedals are read only after homing completes */
+#endif
 
   HAL_Delay(100u); /* EE-SX95 power-on stabilization. */
 #if M23_SENSOR_UART_TEST_ONLY
